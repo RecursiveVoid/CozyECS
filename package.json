@@ -1,0 +1,68 @@
+{
+  "name": "cozyecs",
+  "version": "0.0.1",
+  "description": "",
+  "main": "dist/index.cjs",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "scripts": {
+    "build": "rollup -c",
+    "prepublishOnly": "npm run build",
+    "format": "prettier --write \"src/**/*.{ts,js}\"",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "benchmark": "node benchmarks/ecs.benchmark.js"
+  },
+  "keywords": [
+    "ecs"
+  ],
+  "author": "M. Ergin Turk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RecursiveVoid/cozyecs.git"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.1",
+    "@rollup/plugin-node-resolve": "^15.3.0",
+    "@rollup/plugin-terser": "^0.4.4",
+    "@rollup/plugin-typescript": "^12.1.2",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.2.0",
+    "@types/benchmark": "^2.1.5",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.9.0",
+    "benchmark": "^2.1.4",
+    "bitecs": "^0.3.40",
+    "emitix": "^2.3.2",
+    "geotic": "^4.3.2",
+    "jest": "^29.7.0",
+    "perform-ecs": "^0.7.8",
+    "prettier": "^3.4.2",
+    "rollup": "^4.27.4",
+    "rollup-plugin-dts": "^6.1.1",
+    "rollup-plugin-strip": "^1.2.2",
+    "rollup-plugin-visualizer": "^5.14.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "tslib": "^2.8.1",
+    "typescript": "^5.6.3"
+  },
+  "type": "module",
+  "files": [
+    "dist/",
+    "!dist/core/",
+    "!dist/src/",
+    "!dist/react/",
+    "!dist/__tests__/"
+  ],
+  "exports": {
+    ".": {
+      "require": "./dist/index.cjs",
+      "import": "./dist/index.esm.js",
+      "types": "./dist/index.d.ts"
+    }
+  }
+}
