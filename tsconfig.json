@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ESNext", 
+    "module": "ESNext",
+    "moduleResolution": "Node", 
+    "esModuleInterop": true, 
+    "skipLibCheck": true, 
+    "strict": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "importHelpers": true,
+    "noEmitHelpers": true,
+    "strictNullChecks": false,
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "allowSyntheticDefaultImports": true,
+    "declaration": false,
+    "removeComments": true,
+    "stripInternal": true,
+  }
+}
