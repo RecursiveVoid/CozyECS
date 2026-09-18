@@ -1,7 +1,7 @@
 {
   "name": "cozyecs",
-  "version": "0.0.1",
-  "description": "",
+  "version": "0.1.0",
+  "description": "A tiny, fast archetype ECS for TypeScript and JavaScript: typed-array storage, zero dependencies, and systems that compile to WebGPU compute shaders.",
   "main": "dist/index.cjs",
   "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
@@ -18,13 +18,29 @@
     "benchmark:gpu": "node benchmarks/gpu.js"
   },
   "keywords": [
-    "ecs"
+    "ecs",
+    "entity-component-system",
+    "archetype",
+    "game-engine",
+    "gamedev",
+    "typed-arrays",
+    "data-oriented",
+    "webgpu",
+    "wgsl",
+    "gpu",
+    "compute-shader",
+    "typescript",
+    "performance"
   ],
   "author": "M. Ergin Turk",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/RecursiveVoid/cozyecs.git"
+    "url": "git+https://github.com/RecursiveVoid/CozyECS.git"
+  },
+  "homepage": "https://github.com/RecursiveVoid/CozyECS#readme",
+  "bugs": {
+    "url": "https://github.com/RecursiveVoid/CozyECS/issues"
   },
   "devDependencies": {
     "@javelin/ecs": "^1.0.0-alpha.13",
@@ -61,7 +77,8 @@
   "files": [
     "dist/",
     "!dist/__tests__/",
-    "!dist/gpu/types/"
+    "!dist/gpu/types/",
+    "!dist/**/*.map"
   ],
   "exports": {
     ".": {
