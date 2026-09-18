@@ -34,6 +34,12 @@ jobs:
           cp -R demo/. _site/
           cp -R dist/. _site/dist/
           find _site/dist \( -name '*.map' -o -name '*.d.ts' \) -delete
+          # Pages lets browsers cache files for 10 minutes. Stamp the commit onto the
+          # script URLs so a new deploy never pairs new HTML with an old script.
+          v="${GITHUB_SHA::7}"
+          sed -i "s|\./main\.js|./main.js?v=$v|" _site/index.html
+          sed -i "s|'\./dist/index\.esm\.js'|'./dist/index.esm.js?v=$v'|; s|'\./dist/gpu/index\.esm\.js'|'./dist/gpu/index.esm.js?v=$v'|" _site/main.js
+          grep -q "main.js?v=$v" _site/index.html && grep -q "index.esm.js?v=$v" _site/main.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
