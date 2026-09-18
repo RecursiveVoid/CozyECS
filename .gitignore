@@ -21,3 +21,5 @@ Thumbs.db
 coverage/
 lcov-report/
 *.lcov
+# rollup-plugin-visualizer output
+stats.html

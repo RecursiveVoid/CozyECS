@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Core bundle must not reference the GPU module
+        run: '! grep -lE "webgpu|navigator\.gpu" dist/index.esm.js dist/index.cjs'
+      - run: npm test -- --coverage=false
+        env:
+          # Hosted runners have no GPU. The Dawn suite would only find a software
+          # adapter (or none); the GPU logic is still covered by the mock-device,
+          # parser, codegen and CPU-parity suites.
+          COZYECS_SKIP_DAWN: '1'

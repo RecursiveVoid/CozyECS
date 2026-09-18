@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The build tsconfig sets importHelpers + noEmitHelpers so rollup supplies
+    // tslib. ts-jest has no equivalent injection, so a downlevelled dynamic
+    // import emits __importStar with nothing defining it. Tests emit helpers.
+    "importHelpers": false,
+    "noEmitHelpers": false
+  },
+  "include": ["src", "__tests__"]
+}

@@ -1,5 +1,13 @@
-export { Component } from './Component';
-export { ComponentStorage } from './Storage';
-export { System } from './System';
-export * from './Types';
-export { World } from './World';
+export { World } from './world';
+export type { WorldOptions, SpawnInitFn } from './world';
+export { System } from './system';
+export type { SystemHandle, SystemOptions, FunctionSystemOptions, SystemFn, SystemClass } from './system';
+export { component, tag } from './component';
+export type { ComponentType, ComponentOptions } from './component';
+export { f32, f64, i8, i16, i32, u8, u16, u32, bool, str } from './types';
+export type { Schema, ColumnsOf, ValuesOf, FieldToken, TypedArray, EntityCallback } from './types';
+export { Archetype } from './archetype';
+export type { Chunk } from './archetype';
+export { Query } from './query';
+export type { QueryDesc, QueryForEachFn, QueryForEachColumnsFn, ColumnsTuple } from './query';
+export { StringTable } from './strings';
