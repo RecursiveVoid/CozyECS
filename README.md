@@ -117,7 +117,8 @@ world.update(1 / 60); // dispatches with the other systems and never blocks
   TypeScript, add `@webgpu/types` as a dev dependency for the WebGPU types.
 
 **[Try it live](https://recursivevoid.github.io/CozyECS/):** 10k to 1M particles as entities, one kernel,
-and a CPU/GPU switch. At 1M particles on an Apple M4, the CPU backend uses ~15–20 ms of main-thread
+and a CPU/GPU switch, with a live view of the archetype's memory layout, the systems running each tick,
+entity memory, and five tracked entities whose values are read back from GPU memory. At 1M particles on an Apple M4, the CPU backend uses ~15–20 ms of main-thread
 time per frame; the GPU backend uses ~0.04 ms and draws straight from the kernel's buffer.
 
 The GPU module is **experimental**: its API may change in a minor release. The subset grammar,

@@ -30,7 +30,7 @@
 
   .panel { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
-  #controls { top: 16px; left: 16px; width: 340px; max-width: calc(100vw - 32px); padding: 18px; }
+  #controls { top: 16px; left: 16px; width: 340px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow-y: auto; padding: 18px; }
   h1 { margin: 0; font-size: 20px; letter-spacing: -0.3px; }
   h1 span { color: var(--text-2); font-weight: 400; }
   .lede { margin: 6px 0 16px; color: var(--text-2); font-size: 13px; }
@@ -54,11 +54,47 @@
   .btn:disabled { opacity: 0.5; cursor: progress; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: 1px; }
 
-  #code { right: 16px; bottom: 16px; width: 430px; max-width: calc(100vw - 32px); padding: 14px 16px; }
-  #code .label { margin-top: 0; }
-  pre { margin: 0; font: 12px/1.55 var(--mono); color: #c9d1d9; white-space: pre; overflow-x: auto; }
+  canvas#overlay { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; }
+  #ecs { right: 16px; bottom: 16px; width: 440px; max-width: calc(100vw - 32px); max-height: calc(100vh - 80px);
+    overflow-y: auto; padding: 12px 16px 14px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 4px; }
+  .tabs button { appearance: none; border: 0; background: transparent; color: var(--text-2); font: inherit; font-size: 13px;
+    padding: 6px 10px; border-radius: 7px; cursor: pointer; }
+  .tabs button[aria-selected="true"] { color: var(--text); background: rgba(240,246,252,0.08); }
+  #ecs .label { display: flex; align-items: baseline; gap: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font: 12px var(--mono); color: var(--text-2); padding: 4px 8px; border-radius: 7px;
+    background: rgba(240,246,252,0.05); border: 1px solid var(--border); border-left: 3px solid var(--c); }
+  .chip b { color: var(--text); font-weight: 600; }
+  .layout { display: flex; height: 26px; border-radius: 7px; overflow: hidden; gap: 2px; }
+  .layout div { display: flex; align-items: center; justify-content: center; font: 11px var(--mono); color: #fff;
+    background: var(--c); position: relative; overflow: hidden; }
+  .layout div::after { content: ""; position: absolute; inset: 0; width: 30%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.28), transparent); animation: scan 2.4s linear infinite; }
+  @keyframes scan { from { transform: translateX(-120%); } to { transform: translateX(420%); } }
+  .meta { margin-top: 6px; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+  .tick { margin-left: auto; font: 11.5px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; }
+  .systems { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; counter-reset: sys; }
+  .systems li { background: rgba(240,246,252,0.04); border: 1px solid var(--border); border-radius: 9px; padding: 7px 10px 8px; }
+  .sys-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .sys-head .grp { font: 11px var(--mono); color: var(--muted); padding: 1px 6px; border: 1px solid var(--border); border-radius: 5px; }
+  .sys-head .t { margin-left: auto; font: 12px var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
+  .systems small { display: block; color: var(--text-2); font-size: 11.5px; margin: 2px 0 6px 16px; }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 0 rgba(12,163,12,0.6);
+    animation: pulse 1s ease-out infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,0.55); } 100% { box-shadow: 0 0 0 7px rgba(12,163,12,0); } }
+  .bar { height: 4px; border-radius: 2px; background: rgba(240,246,252,0.07); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; border-radius: 2px; background: var(--blue); transition: width 0.25s, background 0.25s; }
+  .src { margin-left: auto; font-size: 11px; text-transform: none; letter-spacing: 0; color: var(--muted); }
+  table.watch { width: 100%; border-collapse: collapse; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+  .watch th { text-align: right; color: var(--muted); font-weight: 400; padding: 2px 4px; font-size: 11px; }
+  .watch th:first-child, .watch td:first-child { text-align: left; }
+  .watch td { text-align: right; padding: 3px 4px; color: var(--text); border-top: 1px solid rgba(240,246,252,0.06); }
+  .watch td:first-child span { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--c); }
+  .watch td small { color: var(--muted); }
+  pre { margin: 6px 0 0; font: 12px/1.55 var(--mono); color: #c9d1d9; white-space: pre; overflow-x: auto; }
   .tok-k { color: #ff7b72; } .tok-n { color: #79c0ff; } .tok-p { color: #d2a8ff; } .tok-c { color: var(--muted); }
-  #code .foot { margin-top: 10px; font-size: 12px; color: var(--text-2); }
+  #ecs .foot { margin-top: 10px; font-size: 12px; color: var(--text-2); }
 
   #links { top: 16px; right: 16px; padding: 8px 10px; display: flex; gap: 12px; font-size: 13px; }
   a { color: var(--text-2); text-decoration: none; } a:hover { color: var(--text); }
@@ -68,8 +104,15 @@
     font-size: 13px; display: none; }
 
   @media (max-width: 820px) {
-    #code { display: none; }
-    #controls { width: auto; right: 16px; }
+    #ecs { display: none; }
+    #controls { width: auto; right: 12px; left: 12px; top: 12px; max-height: 52vh; padding: 12px 14px; }
+    #controls .lede, #controls .note { display: none; }
+    #controls .label { margin: 8px 0 4px; }
+    .stats { grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px; }
+    .stat { padding: 6px 8px; }
+    .stat b { font-size: 16px; }
+    .stat small { font-size: 10.5px; }
+    #controls .row { margin-top: 8px; }
     #links { display: none; }
     #hint { bottom: 12px; }
   }
@@ -77,6 +120,7 @@
 </head>
 <body>
 <canvas id="stage" aria-label="Particle simulation. Drag to attract particles."></canvas>
+<canvas id="overlay" aria-hidden="true"></canvas>
 
 <section id="controls" class="panel" aria-label="Demo controls">
   <h1>CozyECS <span>· GPU particles</span></h1>
@@ -102,7 +146,10 @@
     <div class="stat"><b id="ms">–</b><small>main-thread ms / frame</small></div>
     <div class="stat"><b id="n">–</b><small>entities</small></div>
     <div class="stat"><b id="be">–</b><small>kernel backend</small></div>
+    <div class="stat"><b id="mem">–</b><small>entity memory (RAM)</small></div>
+    <div class="stat"><b id="bpe">–</b><small>bytes per entity</small></div>
   </div>
+  <p class="note" id="memNote">–</p>
 
   <p class="note" id="autoNote">–</p>
   <div class="row">
@@ -118,10 +165,53 @@
   <a href="https://github.com/RecursiveVoid/CozyECS/blob/main/docs/GPU.md">GPU docs</a>
 </nav>
 
-<section id="code" class="panel" aria-label="Kernel source">
-  <div class="label">The kernel (this exact function runs on both backends)</div>
-  <pre id="src"></pre>
-  <div class="foot">No shader code: <code>kernelSystem()</code> parses the function and compiles it to WGSL and to a JS loop. Pointer position and strength arrive as uniforms (<code>u</code>).</div>
+<section id="ecs" class="panel" aria-label="Inside the ECS">
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="world">Inside the world</button>
+    <button role="tab" aria-selected="false" data-tab="kernel">The kernel</button>
+  </div>
+
+  <div id="tab-world" role="tabpanel">
+    <div class="label">Components</div>
+    <div class="chips">
+      <span class="chip" style="--c: var(--blue)"><b>Position</b> { x: f32, y: f32 }</span>
+      <span class="chip" style="--c: var(--aqua)"><b>Velocity</b> { vx: f32, vy: f32 }</span>
+    </div>
+
+    <div class="label">Archetype table · Position + Velocity</div>
+    <div class="layout" id="layout"></div>
+    <div class="meta" id="archmeta">–</div>
+
+    <div class="label">Systems · <code>world.update()</code> <span class="tick" id="tick">tick 0</span></div>
+    <ol class="systems">
+      <li id="sys-particles">
+        <div class="sys-head"><span class="pulse"></span><b>particles</b><span class="grp">update</span><span class="t" id="t-particles">–</span></div>
+        <small id="d-particles">kernelSystem</small>
+        <div class="bar"><i id="b-particles"></i></div>
+      </li>
+      <li id="sys-watch">
+        <div class="sys-head"><span class="pulse"></span><b>watch</b><span class="grp">render</span><span class="t" id="t-watch">–</span></div>
+        <small id="d-watch">reads 5 entities</small>
+        <div class="bar"><i id="b-watch"></i></div>
+      </li>
+      <li id="sys-render">
+        <div class="sys-head"><span class="pulse"></span><b>render</b><span class="grp">render</span><span class="t" id="t-render">–</span></div>
+        <small id="d-render">WebGPU draw</small>
+        <div class="bar"><i id="b-render"></i></div>
+      </li>
+    </ol>
+
+    <div class="label">Watched entities <span class="src" id="watchsrc"></span></div>
+    <table class="watch">
+      <thead><tr><th>entity</th><th>x</th><th>y</th><th>speed</th></tr></thead>
+      <tbody id="watch"></tbody>
+    </table>
+  </div>
+
+  <div id="tab-kernel" role="tabpanel" hidden>
+    <pre id="src"></pre>
+    <div class="foot">No shader code: <code>kernelSystem()</code> parses this function and compiles it to WGSL and to a JS loop. Pointer position and strength arrive as uniforms (<code>u</code>).</div>
+  </div>
 </section>
 
 <div id="banner" class="panel" role="status"></div>
