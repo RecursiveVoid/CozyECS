@@ -1,6 +1,6 @@
 {
   "name": "cozyecs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A tiny, fast archetype ECS for TypeScript and JavaScript: typed-array storage, zero dependencies, and systems that compile to WebGPU compute shaders.",
   "main": "dist/index.cjs",
   "module": "dist/index.esm.js",
