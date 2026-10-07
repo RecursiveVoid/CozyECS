@@ -184,6 +184,11 @@ function removeFrom(groups: Map<string, Runnable[]>, name: string, list: Runnabl
 
 const EMPTY_GROUP: readonly Runnable[] = Object.freeze([]);
 
+/** Teardown order comparator: later registrations first. */
+function bySeqDescending(a: Runnable, b: Runnable): number {
+  return b._seq - a._seq;
+}
+
 /**
  * @internal Holds registered systems per group, sorted stably by (order, _seq).
  * Group arrays are copy-on-write: add/remove replace the array, so a loop over the
@@ -230,6 +235,23 @@ export class Scheduler {
       if (other.indexOf(system) !== -1) return removeFrom(groups, name, other, system);
     }
     return false;
+  }
+
+  /**
+   * @internal Removes EVERY system and group in one step and returns them in reverse
+   * registration order (highest `_seq` first), which is the order `World.dispose` tears systems
+   * down in: last registered, first destroyed, regardless of group.
+   *
+   * The groups are cleared BEFORE the caller runs any `onDestroy`, so a system whose
+   * `onDestroy` calls `world.removeSystem(...)` finds nothing registered and cannot be
+   * destroyed twice.
+   */
+  drain(): Runnable[] {
+    const out: Runnable[] = [];
+    for (const list of this._groups.values()) for (let i = 0; i < list.length; i++) out.push(list[i]);
+    this._groups.clear();
+    out.sort(bySeqDescending);
+    return out;
   }
 
   /** Sorted systems of `group` (empty frozen array if none). Do not mutate. */

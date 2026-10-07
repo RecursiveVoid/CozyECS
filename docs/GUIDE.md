@@ -16,6 +16,8 @@ For the GPU entry point see [GPU.md](GPU.md); for how the internals work see
   - [Deferred structural changes](#deferred-structural-changes)
   - [Events](#events)
   - [Shared buffers and column invalidation](#shared-buffers-and-column-invalidation)
+  - [Reclaiming memory](#reclaiming-memory)
+  - [The teardown ladder: destroy, removeSystem, clear, dispose](#the-teardown-ladder-destroy-removesystem-clear-dispose)
   - [GPU kernels (experimental)](#gpu-kernels-experimental)
 - [API reference](#api-reference)
 - [Performance tips](#performance-tips)
@@ -384,6 +386,230 @@ const stale = xs !== particles.col(Position).x;  // true: re-fetch after structu
   one fragmented-iteration case ([details](../benchmarks/RESULTS.md)).
   Keep the default (`false`) unless you use workers.
 
+### Reclaiming memory
+
+Tables grow and never shrink by themselves. After a wave of destroys, a level teardown or a
+spawn burst that is over, the capacity stays reserved. CozyECS gives you three calls to look at
+that and to take it back.
+
+**Mechanism, never policy.** Nothing runs on a tick, there is no background or heuristic GC, and
+no entity references are traced. Your engine decides *when* to reclaim; CozyECS only makes it
+possible, because the buffers are private.
+
+```ts
+const m = world.memory();
+m.tables.used;        // bytes the live rows occupy
+m.tables.reserved;    // bytes the buffers hold -- the difference is the slack
+m.total;              // tables.reserved + the entity index
+```
+
+`world.memory()` is diagnostic and **allocates**, so it belongs in a debug overlay or a test,
+not in a frame.
+
+```ts
+// Between ticks only -- never inside a system or a forEach.
+const stats = world.compact();
+// Measured after destroying 99,000 of 100,000 Position+Velocity entities:
+// { archetypes: 1, bytesFreed: 1979520 }
+```
+
+`world.compact()` deflates every archetype to the capacity the growth policy would have reached
+for its live row count, so the next spawn does not immediately re-grow the table. By default it
+skips any table with less than 4096 bytes of slack (`{ minBytes }`), so it never churns.
+`{ strings: true }` also rebuilds the string table and drops strings no live row references —
+which **renumbers interned ids**, so only ids stored inside the world survive it.
+
+```ts
+world.clear();                       // every entity gone in one pass, every table deflated
+world.clear({ compact: false });     // keep the capacities, a refill is coming
+world.clear({ events: true });       // fire onRemove / onExit per entity after all
+```
+
+`world.clear()` destroys every entity in one pass and bumps every live entity's generation, so
+handles taken before the call stay dead. **By default it fires no events at all** — skipping the
+per-entity `onRemove` and `onExit` work is the point of the fast path. Pass `{ events: true }`
+when a listener owns something the ECS does not.
+
+What survives all of this: archetype objects and their ids, masks, transition edges and their
+place in every query's `chunks`; queries, systems and component registrations; the string table.
+Only the buffers are replaced, so **re-fetch column arrays afterwards** exactly as you do after
+growth. Spawning works immediately after a `clear()`, and the deflated table re-grows normally.
+
+**Freeing what the ECS does not own.** CozyECS reclaims its own typed arrays and nothing else. A
+texture, an audio node, a DOM element or a socket that an entity stands for is yours, and the
+place to release it is an `onRemove` hook keyed by the entity id — which is also why
+`clear({ events: true })` exists.
+
+```ts
+// Whatever the entity stands for outside the ECS: a texture, an audio node, a DOM node.
+const sprites = new Map<number, { dispose(): void }>();
+
+world.onRemove(Sprite, (entity) => {
+  const sprite = sprites.get(entity);
+  if (sprite) { sprite.dispose(); sprites.delete(entity); }
+});
+
+// A teardown that must run those hooks, then take the bytes back:
+world.clear({ events: true });   // every onRemove / onExit fires, once per entity
+world.compact({ strings: true });
+```
+
+The hook runs *after* the row is gone, so the handle already reads as dead: key your map by the
+entity id and do not try to read its components from inside the hook. If you prefer to tear the
+external resources down yourself, do that first and then take the default `clear()` fast path:
+not making 20,000 hook calls is the whole point of it.
+
+**What CozyECS never reclaims, and why.** Two things are deliberately permanent:
+
+- **The string table is append-only.** `world.strings` only ever grows; a plain `compact()` does
+  not touch it. It is rebuilt only when you ask with `compact({ strings: true })`, because that
+  renumbers ids and only the world can rewrite its own `str` columns — an id you are holding
+  outside is not translated and stops meaning what it meant.
+- **The entity index never shrinks.** The allocator's per-index arrays keep a generation for
+  every index ever handed out, and that generation is the only reason a stale handle reads as
+  dead. Dropping it would make an old handle look alive again, so it stays. `clear()` can even
+  make `memory().entityIndex` *grow*, because the free list is then sized to hold every index
+  at once (0.8 MB → 1.6 MB for 200,000 entities). That is the price of `isAlive()` being
+  trustworthy.
+
+There is also nothing on a timer and nothing on a tick: no background GC, no heuristic, no
+reference tracing. If you never call `compact()` or `clear()`, nothing is ever given back — and
+every tick costs exactly what it did before.
+
+A single table can be deflated on its own with `archetype.shrinkToFit(minCapacity = 0)`, which
+is the primitive the two calls above are built on. On the GPU side, `kernel.releaseUnused()`
+gives the device buffers back ([GPU.md](GPU.md)).
+
+Full reference, including the exact options and the between-ticks error:
+[docs/API.md](API.md#memory-measuring-and-reclaiming-it).
+
+When the whole world is going away rather than its contents, the last rung is `world.dispose()`:
+see [the teardown ladder](#the-teardown-ladder-destroy-removesystem-clear-dispose) below.
+
+### The teardown ladder: `destroy`, `removeSystem`, `clear`, `dispose`
+
+Four calls, each one level wider than the last. Reach for the narrowest one that covers what you
+are actually tearing down.
+
+| call | scope | what it gives back | what is still standing afterwards |
+|---|---|---|---|
+| `world.destroy(entity)` | one entity | its row — the last row is swapped into it. **No bytes:** the table keeps its capacity | everything else |
+| `world.removeSystem(system)` | one system | its slot in the scheduler. `enabled` becomes `false`, and a class system's `onDestroy()` runs once | entities, tables, queries, every other system |
+| `world.clear()` *(+ `compact()`)* | the contents | every entity, and by default every table byte | archetypes, queries, systems, component registrations, the string table — the world is immediately reusable |
+| `world.dispose()` | the whole world | everything the world owns, the entity index and the interned strings included | nothing inside the world. The world is inert for good |
+
+The first three are covered above and in [API.md](API.md#memory-measuring-and-reclaiming-it);
+`dispose()` is the last rung.
+
+```js
+world.dispose();     // between ticks: not inside a system, not inside a forEach
+world.disposed;      // true
+```
+
+It runs in a fixed order: registered dispose hooks first (with the world still fully readable),
+then every system is unregistered and `onDestroy()` called on class systems in reverse
+registration order, then every cached query drops its archetypes, its listeners and its compiled
+loops, then the `onAdd`/`onRemove` listeners, then **queued structural commands are discarded
+without being applied**, then every table is deflated to a zero-length buffer and the archetype
+list is emptied, then the entity index is released — which is what makes every handle report
+dead — and finally the view cache, the component registry and the interned strings are dropped.
+
+**The post-dispose rule**, in one line: *mutating calls throw, read-only calls stay safe and
+answer for an empty world, teardown calls stay no-ops.*
+
+| after `dispose()` | behaviour |
+|---|---|
+| `spawn`, `spawnMany`, `destroy`, `add`, `remove`, `set`, `enable`, `archetype`, `query`, `onAdd`, `onRemove`, `system`, `addSystem`, `update`, `compact`, `clear`, `query.onEnter`, `query.onExit` | throw an `Error` naming `dispose()` |
+| `isAlive` → `false`, `has` → `false`, `get` → `undefined`, `query.count()` → `0`, `forEach` iterates nothing, `memory()` all zeros, `disposed` → `true` | safe, and answer for an empty world |
+| `dispose()`, `removeSystem()`, `flush()`, and every unsubscribe function handed out earlier | no-ops |
+
+Three details worth knowing:
+
+- **It is idempotent.** A second `dispose()` does nothing, and `onDestroy()` still ran exactly
+  once.
+- **It does not need an empty command queue.** `compact()` and `clear()` refuse to run with
+  structural commands pending; `dispose()` accepts them and throws them away — no `onRemove`
+  fires for a queued destroy. It does share the other guard: calling it during iteration or a
+  flush throws `cannot run during iteration; call it between ticks`.
+- **A hook or an `onDestroy()` that throws does not abort the teardown.** The world is disposed
+  completely and the first error is rethrown by `dispose()` afterwards.
+
+One wrinkle in the throw list: `enable(entity, C)` on a component that is not `enableable`
+reports *that* (`component X is not enableable`) even on a disposed world, because the
+enableable check comes first. On an enableable component it names `dispose()` like the rest.
+
+**Why there is no `component.destroy()`.** Components are **process-global**, not per-world: the
+id a `component()` call takes comes from one module-level counter and is baked straight into
+every archetype mask, into every query mask and into the position of every id-indexed array in
+every world in the process. Freeing one id would either corrupt the masks that already contain it
+or force a renumbering of every mask and every array everywhere — and the descriptor is meant to
+be shared by every world anyway. So `dispose()` deliberately leaves components alone, which is
+exactly why you can build a fresh `World` the line after and keep using the same components.
+
+**Releasing what the world does not own.** `dispose()` reclaims the ECS's own typed arrays and
+nothing else. For resources attached to a world from outside, register a hook:
+
+```js
+import { registerWorldDisposeHook } from 'cozyecs';
+
+const off = registerWorldDisposeHook((world) => {
+  // Runs first, with the world still fully readable: walk it, then release your own things.
+  releaseRenderResourcesFor(world);
+});
+
+// off() unregisters it; calling off() twice is fine.
+```
+
+The hook list is **process-wide** and holds nothing but functions, so it can never keep a world
+alive: a hook finds its own per-world state through its own (weakly keyed) table. It runs for
+every world disposed after it was registered, and it must not mutate the world — every mutating
+entry point already throws by then.
+
+This is the pattern `cozyecs/gpu` follows: disposing a world releases its device buffers, and the
+core bundle still contains no GPU code at all (see [GPU.md](GPU.md#311-disposing-a-world); the
+mechanics are in [INTERNALS.md](INTERNALS.md#world-teardown-worldts-gpuruntimets)).
+
+For per-entity resources, the right hook is still `onRemove` plus `clear({ events: true })`, as
+above — `dispose()` fires no `onRemove` at all.
+
+**Does it leak?** Measured, not asserted. `__tests__/leak.test.ts` builds a world of 20,000
+entities (~2 MB of tables across three archetypes, plus cached queries, a function system, a
+class system, component hooks, enter/exit listeners and a string table), runs 12 ticks, churns
+it, drops it, and repeats. Between cycles it yields to the macrotask queue, calls `global.gc()`
+three times and samples `process.memoryUsage()`. The figure reported is the **least-squares slope
+per cycle** — a leak is linear in cycles, harness noise is not. On node 22.14 / Apple M4
+(`npm run test:leak`):
+
+```
+scenario                              arrayBuffers      heapUsed   cycles
+1. build -> run -> dispose -> drop      0 B/cycle    3381 B/cycle     20
+2. build -> run -> drop, NO dispose     0 B/cycle     123 B/cycle     20
+4. 20k churn ops, then compact()        0 B/cycle    4597 B/cycle     10
+5. system/query/listener churn x5000    0 B/cycle   16958 B/cycle     10
+```
+
+That is one run. A second run on the same machine gave 3407 / 1080 / 2786 / 19519 B per cycle on
+the `heapUsed` column and **0 B per cycle on `arrayBuffers` every time**, which is the split to
+read: the buffer meter is the stable one.
+
+One leaked world would be ~2 MB per cycle on the `arrayBuffers` meter, which is the meter that
+matters here: every entity byte CozyECS owns lives in an `ArrayBuffer`. The `heapUsed` slopes sit
+between 0.1 KB and 20 KB per cycle against a suite tolerance of 192 KiB, and V8's own bookkeeping
+(compilation-cache entries for the per-world `new Function` row loops, feedback vectors,
+internalized strings) lands on that meter — so read those numbers as *flat*, not as zero.
+`compact({ strings: true })` after 5,000 dead interned strings left 2.
+
+Scenario 2 is the honest one: **a dropped world is collectable without `dispose()`.** There is no
+module-level registry of worlds, and `WeakRef`s confirm the `World`, its `Archetype`s and the raw
+`ArrayBuffer` are all collected either way. `dispose()` is not a fix for a retention bug in the
+library; it is how you get the bytes back *now*, deterministically, and how resources the ECS does
+not own get released with the world.
+
+If a browser memory graph told you otherwise: Chrome's `performance.memory` largely **excludes**
+`ArrayBuffer` memory, so it cannot see the tables at all, and what it does show lags collection of
+large buffers. A page that rebuilds its world will look alarming there while holding nothing.
+Measure in node, where `process.memoryUsage().arrayBuffers` can answer the question.
+
 ### GPU kernels (experimental)
 
 > **EXPERIMENTAL.** The API, the kernel subset and the break-even constants may
@@ -496,6 +722,17 @@ world.update(1 / 60);  // dispatches inside the system's group, never blocks
 | `removeSystem(system)` | Unregisters a system, sets `enabled = false` and calls `onDestroy()` for class systems. |
 | `update(dt = 0, group = 'update')` | Runs the group's enabled systems in order, flushing after each one. If a system throws, pending commands are flushed and the error propagates. |
 | `flush()` | Applies queued structural changes. No-op while iterating or already flushing. |
+| `memory(): WorldMemory` | Snapshot of ECS-owned storage: `entities`, `tables.used` / `tables.reserved`, `entityIndex`, `strings.count`, `total` and a per-archetype list. Diagnostic, so it allocates — not for per-frame use. |
+| `compact({ strings?, minBytes? }): CompactStats` | Deflates every archetype to the growth-policy capacity for its live rows (0 for an empty one), skipping tables with less than `minBytes` (default 4096) of slack. `strings: true` also rebuilds the string table and **renumbers interned ids**. Returns `{ archetypes, bytesFreed, strings? }`. Throws if called during iteration or with commands queued. |
+| `clear({ events?, compact? }): void` | Destroys every entity in one pass, bumping every generation, and (unless `compact: false`) deflates every table. Fires **no** `onRemove` / `onExit` unless `events: true`. Throws if called during iteration or with commands queued. |
+| `dispose(): void` | Final teardown of the whole world: runs every registered dispose hook, unregisters every system (`onDestroy()` once per class system), drops queries, listeners and the view cache, **discards queued commands without applying them**, deflates every table, releases the entity index and the string table. Idempotent. Afterwards every mutating call throws and every read answers for an empty world. Throws if called during iteration, but unlike `compact` / `clear` it does not require an empty command queue. |
+| `disposed: boolean` | True once `dispose()` has run. A disposed world cannot be revived. |
+
+Module-level:
+
+| function | description |
+|---|---|
+| `registerWorldDisposeHook(hook): () => void` | Registers `hook(world)` to run at the start of every later `world.dispose()`, while the world is still fully readable. Process-wide and holds only functions, so it cannot keep a world alive. Returns an idempotent unregister function. A hook that throws does not abort the teardown; the first error is rethrown by `dispose()`. |
 
 ### `Query`
 
@@ -523,9 +760,12 @@ world.update(1 / 60);  // dispatches inside the system's group, never blocks
 | `isEnabled(C, row): boolean` | The flag for one row. |
 | `components` | The component types, sorted by id. |
 | `buffer`, `shared`, `rowBytes` | The backing buffer, whether it is a `SharedArrayBuffer`, and bytes per row. |
+| `ensureCapacity(minCapacity)` | Grows to at least `minCapacity` rows in one reallocation. No-op if already large enough. |
+| `shrinkToFit(minCapacity = 0): boolean` | Reallocates to `max(count, minCapacity)` rows and returns whether it reallocated. The archetype object, its id, mask, edges and query membership survive; only the storage is replaced. A target of 0 leaves a zero-length buffer. |
 
 The typed arrays from `entities`, `col(C)` and `enabledArray(C)` are replaced when the table
-grows (see [column invalidation](#shared-buffers-and-column-invalidation)).
+grows **or shrinks** (see [column invalidation](#shared-buffers-and-column-invalidation) and
+[reclaiming memory](#reclaiming-memory)).
 
 ### Systems
 
@@ -534,7 +774,8 @@ grows (see [column invalidation](#shared-buffers-and-column-invalidation)).
 | `SystemHandle` | Returned by `world.system`. Fields: `name`, `group`, `order`, `query`, `fn` and a writable `enabled`. |
 | `abstract class System` | Fields: `world`, `name`, `group`, `order` and `enabled`. `query(desc)` is shorthand for `world.query`. Implement `onUpdate(dt)`. `onCreate()` and `onDestroy()` are optional. |
 
-Exported types: `WorldOptions`, `SpawnInitFn`, `SystemOptions`, `FunctionSystemOptions`,
+Exported types: `WorldOptions`, `WorldDisposeHook`, `SpawnInitFn`, `WorldMemory`, `ArchetypeMemory`,
+`CompactOptions`, `CompactStats`, `ClearOptions`, `SystemOptions`, `FunctionSystemOptions`,
 `SystemFn`, `SystemClass`, `ComponentType`, `ComponentOptions`, `Schema`, `ColumnsOf`,
 `ValuesOf`, `FieldToken`, `TypedArray`, `EntityCallback`, `QueryDesc`, `QueryForEachFn`,
 `QueryForEachColumnsFn`, `ColumnsTuple` and `Chunk`.

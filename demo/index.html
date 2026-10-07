@@ -48,6 +48,9 @@
   .note { margin-top: 12px; font-size: 12.5px; color: var(--text-2); }
   .note strong { color: var(--text); font-weight: 600; }
   .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+  .row .note { flex: 1; min-width: 0; }
+  .row .btn { flex: 0 0 auto; }
+  #reclaim[disabled] { cursor: default; }
   .btn { appearance: none; border: 1px solid var(--border); background: rgba(240,246,252,0.06); color: var(--text);
     font: inherit; font-size: 12.5px; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
   .btn:hover:not(:disabled) { background: rgba(240,246,252,0.12); }
@@ -107,6 +110,7 @@
     #ecs { display: none; }
     #controls { width: auto; right: 12px; left: 12px; top: 12px; max-height: 52vh; padding: 12px 14px; }
     #controls .lede, #controls .note { display: none; }
+    #controls .rnote { display: block; font-size: 11.5px; }
     #controls .label { margin: 8px 0 4px; }
     .stats { grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px; }
     .stat { padding: 6px 8px; }
@@ -146,10 +150,14 @@
     <div class="stat"><b id="ms">–</b><small>main-thread ms / frame</small></div>
     <div class="stat"><b id="n">–</b><small>entities</small></div>
     <div class="stat"><b id="be">–</b><small>kernel backend</small></div>
-    <div class="stat"><b id="mem">–</b><small>entity memory (RAM)</small></div>
+    <div class="stat"><b id="mem">–</b><small>used / reserved (RAM)</small></div>
     <div class="stat"><b id="bpe">–</b><small>bytes per entity</small></div>
   </div>
   <p class="note" id="memNote">–</p>
+  <div class="row">
+    <button class="btn" id="reclaim" title="world.clear() then world.compact(), then spawn the particles again">Clear + compact</button>
+    <p class="note rnote" id="reclaimNote" style="margin-top: 0"></p>
+  </div>
 
   <p class="note" id="autoNote">–</p>
   <div class="row">

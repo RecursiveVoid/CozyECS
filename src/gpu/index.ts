@@ -41,7 +41,7 @@ import type { IRComponent, IRFieldKind, IRUniform, KernelIR } from './ir';
 import { KernelError, validateIR } from './ir';
 import { kernelSource, parseKernel } from './parse';
 import { KernelRuntime, trackRuntime } from './runtime';
-import type { AutoThresholds, KernelBackend, KernelStats, KernelTarget, ReadbackMode } from './runtime';
+import type { AutoThresholds, KernelBackend, KernelMemory, KernelStats, KernelTarget, ReadbackMode } from './runtime';
 
 export { getGPUContext, hasGPUContext, peekGPUContext, setGPUProvider } from './device';
 export type { GPUContext, GPUCapabilities } from './device';
@@ -55,13 +55,23 @@ export {
   GPU_FIXED_OVERHEAD_NS,
   autoPrefersGPU,
   cpuCostEstimate,
+  disposeWorldKernels,
   flushKernels,
   getAutoThresholds,
+  gpuDeviceMemory,
   setAutoThresholds,
 } from './runtime';
 export { calibrateAuto } from './calibrate';
 export type { CalibrateOptions, CalibrationResult, CoreModule } from './calibrate';
-export type { AutoThresholds, KernelBackend, KernelStats, KernelTarget, ReadbackMode } from './runtime';
+export type {
+  AutoThresholds,
+  GPUDeviceMemory,
+  KernelBackend,
+  KernelMemory,
+  KernelStats,
+  KernelTarget,
+  ReadbackMode,
+} from './runtime';
 
 /** Options for {@link kernelSystem}. */
 export interface KernelSystemOptions {
@@ -153,10 +163,54 @@ export interface KernelExtras {
   /**
    * The device buffer holding an archetype's table, for rendering out of it
    * under `readback: 'none'`. Null on the CPU backend or before the first
-   * dispatch. Replaced when the archetype grows.
+   * dispatch. Replaced when the archetype grows, freed by
+   * {@link releaseUnused}, and reused-but-relaid-out by `world.compact()`:
+   * re-read the field byte offsets after any structural change.
    */
   bufferFor(archetype: Archetype): GPUBuffer | null;
-  /** Unregisters the system and releases its GPU resources. Idempotent. */
+  /**
+   * Frees the device memory this kernel no longer needs -- the tables of empty
+   * archetypes, and the copies left oversized or stale by `world.compact()` /
+   * `world.clear()` -- and returns the bytes released.
+   *
+   * The GPU-side counterpart to `world.compact()`, and mechanism only: nothing
+   * calls it for you, a tick never does, and dispatching is CORRECT without it
+   * (just at high-water-mark device memory). Call it between ticks, after a
+   * compaction or a level teardown -- not every frame, because the next
+   * dispatch over a released archetype re-uploads its table.
+   *
+   * `await sync()` first: anything the GPU has computed but not yet read back
+   * is discarded with the buffers. Under `readback: 'none'` the device copy is
+   * the only copy, so releasing it discards every write since the first
+   * dispatch.
+   *
+   * Device tables are shared between kernels over the same archetype, so the
+   * bytes are reported by whichever kernel releases them first. Returns 0 when
+   * there was nothing to reclaim, on the CPU backend, and after `destroy()`.
+   */
+  releaseUnused(): number;
+  /**
+   * Device memory this kernel is holding right now, plus what it has allocated
+   * and freed over its life. Buffers only -- archetype tables, the uniform
+   * buffer and the readback staging pool.
+   *
+   * `heldBytes` is 0 on the CPU backend, 0 after `destroy()`, and 0 after the
+   * world's `dispose()`. Tables are shared between kernels over the same
+   * archetype and are reported by each of them, so these numbers do not sum
+   * across kernels: `gpuDeviceMemory()` is the process-wide total and the one
+   * to assert on in a leak test.
+   */
+  memory(): KernelMemory;
+  /**
+   * Unregisters the system and releases every GPU resource it holds: device
+   * tables, the uniform buffer, the staging pool, bind groups and residency
+   * bookkeeping. Idempotent, and safe after the world's `dispose()` (which has
+   * already done the GPU half; this then skips `removeSystem`).
+   *
+   * Dispatches afterwards are no-ops and `sync()` resolves immediately. The
+   * handle itself holds nothing afterwards -- not the world, not the query --
+   * so keeping a dead handle around cannot keep a world alive.
+   */
   destroy(): void;
 }
 
@@ -267,18 +321,30 @@ export async function kernelSystem(
   trackRuntime(world, handle.group, runtime, true);
   runtime.predictBackend(query);
 
+  // Dropped when the runtime is destroyed, by whichever route: see below.
   // The runtime reads uniform values from here on every dispatch.
   const uniformValues = new Float64Array(uniforms.length);
   for (let i = 0; i < uniforms.length; i++) uniformValues[i] = uniforms[i].initial;
   runtime.uniformValues = uniformValues;
 
+  // `destroy()` drops these so a handle the app keeps cannot pin the world or
+  // its query: the closures below are reachable from the handle, and a captured
+  // `world` would otherwise outlive `world.dispose()`.
+  let liveWorld: World | null = world;
+  let liveQuery: typeof query | null = query;
   let destroyed = false;
+  // `world.dispose()` destroys the runtime without going through this handle,
+  // so the drop has to hang off the runtime, not off `destroy()` below.
+  runtime.whenDestroyed(() => {
+    liveWorld = null;
+    liveQuery = null;
+  });
   const extras: KernelExtras & ThisType<KernelSystemHandle> = {
     ir,
     get backend() {
       // Before the first dispatch, 'auto' reports its prediction for the
       // query's current size rather than "a GPU exists".
-      return runtime.predictBackend(query);
+      return liveQuery ? runtime.predictBackend(liveQuery) : runtime.backend;
     },
     get readback() {
       return runtime.readback;
@@ -306,11 +372,21 @@ export async function kernelSystem(
     },
     markCpuDirty: (archetype?: Archetype) => runtime.markCpuDirty(archetype),
     bufferFor: (archetype: Archetype) => runtime.bufferFor(archetype),
+    releaseUnused: () => runtime.releaseUnused(),
+    memory: () => runtime.memory(),
     destroy: () => {
       if (destroyed) return;
       destroyed = true;
-      world.removeSystem(handle);
-      trackRuntime(world, handle.group, runtime, false);
+      const w = liveWorld;
+      liveWorld = null;
+      liveQuery = null;
+      // `world.dispose()` already destroyed the runtime and every system with
+      // it; calling removeSystem on a disposed world throws by design, so a
+      // handle outliving its world must not try.
+      if (w && !runtime.destroyed) {
+        w.removeSystem(handle);
+        trackRuntime(w, handle.group, runtime, false);
+      }
       runtime.destroy();
     },
   };

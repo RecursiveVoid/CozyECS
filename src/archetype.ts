@@ -84,6 +84,23 @@ export function nextCapacity(cap: number): number {
 }
 
 /**
+ * Smallest capacity the growth policy reaches for `n` rows when a table starts at
+ * `initialCapacity` and grows one `pushRow` at a time (see `nextCapacity`): the capacity
+ * such a table would have while holding `n` rows. `World.compact` deflates to this, so a
+ * compacted table does not reallocate again on the next spawn.
+ */
+export function capacityFor(n: number, initialCapacity: number = 1): number {
+  let cap = Math.floor(initialCapacity);
+  if (!(cap >= 1)) cap = 1;
+  while (cap < n) {
+    const next = nextCapacity(cap);
+    if (next <= cap) return cap; // clamped at MAX_ENTITIES
+    cap = next;
+  }
+  return cap;
+}
+
+/**
  * Precomputed row transfer plan from a source archetype to a target archetype, packed in
  * one Int32Array of length PLAN_HEADER + 2 * D:
  *   [PLAN_SRC_VER]  source `_layoutVersion` the offsets were resolved for (-1 = never)
@@ -528,6 +545,56 @@ export class Archetype {
     if (cap >= minCapacity) return;
     const step = nextCapacity(cap);
     this._resize(step > minCapacity ? step : Math.ceil(minCapacity));
+  }
+
+  /**
+   * Releases unused rows: reallocates the table to `max(count, minCapacity)` rows.
+   * "Deflate, don't delete" -- the archetype OBJECT survives, with its `id`, `mask`, `key`,
+   * `components`, transition edges (`edgesAdd`/`edgesRemove`) and its membership in every
+   * query's `chunks`. Only the storage is replaced: rows [0, count), their entity handles
+   * and their enabled flags are preserved bit-exactly, and views obtained from `col()` /
+   * `enabledArray()` / `entities` are REPLACED, exactly as on growth.
+   *
+   * A target of 0 leaves a zero-length buffer and zero-length views. Such a table re-grows
+   * from capacity 1 on the next `pushRow` (the growth policy restarts), so call
+   * `ensureCapacity` first when the size of the next burst is known.
+   *
+   * A `minCapacity` above the current capacity reallocates to exactly that capacity; the
+   * growth policy is not consulted (use `ensureCapacity` for policy-driven growth).
+   *
+   * This is a MECHANISM, never a policy: nothing calls it on a tick. The engine decides when
+   * to reclaim.
+   *
+   * @param minCapacity rows to keep allocated even when the table holds fewer (default 0).
+   * @returns true if the table was reallocated, false if its capacity was already the target.
+   */
+  shrinkToFit(minCapacity: number = 0): boolean {
+    let target = Math.floor(minCapacity);
+    if (!(target > 0)) target = 0; // also maps NaN / -0 / negatives to 0
+    if (target < this.count) target = this.count;
+    if (target > MAX_ENTITIES) target = MAX_ENTITIES;
+    if (target === this.capacity) return false;
+    this._resize(target);
+    return true;
+  }
+
+  /**
+   * @internal Final teardown (`World.dispose`): drops every row, deflates the table to a
+   * zero-length buffer and clears every reference to OTHER archetypes -- the transition edges
+   * and the row-copy plans, which are keyed by (and hold) the source archetype.
+   *
+   * Unlike {@link shrinkToFit} this is not reusable: an archetype whose edges are gone no
+   * longer belongs to a World. It exists so that holding on to ONE archetype of a disposed
+   * world cannot keep that world's whole archetype graph -- and its buffers -- alive.
+   */
+  _dispose(): void {
+    this.count = 0;
+    this.shrinkToFit(0);
+    this.edgesAdd.clear();
+    this.edgesRemove.clear();
+    this._plans = null;
+    this._lastSource = null;
+    this._lastPlan = null;
   }
 
   /** The buffer backing every column (SharedArrayBuffer if `shared`). Replaced on grow. */

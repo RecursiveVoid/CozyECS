@@ -47,9 +47,30 @@
  *     replaces the buffer and every view);
  *   - `chunk.count` changed since the last dispatch (rows were added or
  *     swap-removed, both of which are CPU-side writes);
+ *   - `chunk.entities[0]` changed, which closes the hole in the count rule:
+ *     empty an archetype and refill it to the SAME row count in the SAME buffer
+ *     (`world.clear({ compact: false })`, or destroying every row and
+ *     respawning) and both of the rules above say "nothing changed", so the
+ *     dispatch would run over last generation's values. Every refilled row has
+ *     a different handle -- the allocator bumps the generation it hands back --
+ *     so row 0's handle is a one-read witness that the rows are not the rows the
+ *     device holds. The same stamp is carried by a readback in flight, so one
+ *     cannot land on rows that now belong to other entities;
+ *   - the archetype was seen EMPTY by a dispatch (`count === 0`), which also
+ *     retires the readbacks in flight for it;
  *   - the app called {@link KernelRuntime.markCpuDirty}.
  * Any other CPU write to a kernel-written field is LOST. That is the documented
  * bargain (docs/GPU.md, "Who owns the data").
+ *
+ * RECLAIMING IS EXPLICIT, LIKE EVERYTHING ELSE
+ *
+ * Device tables grow with the archetype and never shrink on their own: an
+ * oversized buffer is a correct buffer, and reallocating one per frame would
+ * cost a full re-upload every time a table wobbled. `world.compact()` frees
+ * CPU bytes; {@link KernelRuntime.releaseUnused} is the matching GPU-side
+ * mechanism, and nothing calls it for you. A compacted or emptied table still
+ * dispatches CORRECTLY before that call -- it just holds high-water-mark
+ * device memory.
  * ---------------------------------------------------------------------------
  */
 
@@ -355,6 +376,144 @@ export function clearPipelineCache(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Device-memory accounting
+//
+// Every GPUBuffer this file creates goes through `createTrackedBuffer` and
+// every one it destroys through `destroyTrackedBuffer`, so the counters below
+// are not an estimate: they are a census of the buffers that exist. This is
+// what makes "the device memory came back" a testable claim rather than a
+// hope. `performance.memory` in a browser cannot see device memory at all and
+// `process.memoryUsage().arrayBuffers` in Node cannot either, so without this
+// seam a GPU leak is invisible from JavaScript.
+//
+// Pipelines, shader modules and bind groups are NOT counted: they hold no
+// buffer memory, they are cached process-wide by design (see
+// {@link pipelineCacheSize}), and Dawn gives no size for them.
+// ---------------------------------------------------------------------------
+
+/** Device bytes held, allocated and freed by every kernel in this process. */
+export interface GPUDeviceMemory {
+  /**
+   * Bytes in GPUBuffers that exist RIGHT NOW. Zero means this module is
+   * holding no device memory -- what a world's `dispose()` or a kernel's
+   * `destroy()` must get back to.
+   */
+  readonly heldBytes: number;
+  /** Cumulative bytes ever allocated. Monotonic. */
+  readonly allocatedBytes: number;
+  /** Cumulative bytes ever freed. `allocatedBytes - freedBytes === heldBytes`. */
+  readonly freedBytes: number;
+  /** GPUBuffers alive right now. */
+  readonly buffers: number;
+  /** High-water mark of `heldBytes`. */
+  readonly peakBytes: number;
+}
+
+/** One kernel's slice of {@link GPUDeviceMemory}. */
+export interface KernelMemory {
+  /** `tableBytes + uniformBytes + stagingBytes`: device bytes this kernel keeps alive. */
+  readonly heldBytes: number;
+  /**
+   * Of which: archetype table copies. Tables are SHARED between kernels over
+   * the same archetype, so a table held by two kernels is reported by both --
+   * which is why {@link gpuDeviceMemory} and not the sum of these is the
+   * process-wide truth.
+   */
+  readonly tableBytes: number;
+  /** Of which: this kernel's one uniform buffer. */
+  readonly uniformBytes: number;
+  /** Of which: readback staging buffers, pooled and in flight. */
+  readonly stagingBytes: number;
+  /** Archetype tables with at least one live device copy. */
+  readonly tables: number;
+  /** Cumulative bytes allocated BY THIS KERNEL (a shared table counts for its creator). */
+  readonly allocatedBytes: number;
+  /** Cumulative bytes freed by this kernel. */
+  readonly freedBytes: number;
+}
+
+const deviceMem = { held: 0, allocated: 0, freed: 0, buffers: 0, peak: 0 };
+
+/** A kernel's running totals, threaded through the create/destroy helpers. */
+interface MutableKernelMem {
+  allocated: number;
+  freed: number;
+  /** Bytes in this kernel's uniform buffer (0 or 1 buffer). */
+  uniform: number;
+  /** Bytes in staging buffers this kernel owns, pooled or in flight. */
+  staging: number;
+}
+
+/**
+ * The only place in this file that calls `device.createBuffer`. Throws what
+ * `createBuffer` throws (callers that must not fail already catch it), and
+ * counts nothing when it does.
+ */
+function createTrackedBuffer(
+  device: GPUDevice,
+  desc: GPUBufferDescriptor,
+  mem: MutableKernelMem | null,
+): GPUBuffer {
+  const buffer = device.createBuffer(desc);
+  const bytes = desc.size;
+  deviceMem.held += bytes;
+  deviceMem.allocated += bytes;
+  deviceMem.buffers++;
+  if (deviceMem.held > deviceMem.peak) deviceMem.peak = deviceMem.held;
+  if (mem) mem.allocated += bytes;
+  return buffer;
+}
+
+/**
+ * The only place in this file that calls `GPUBuffer.destroy()`. `bytes` is the
+ * size the buffer was created with, because a destroyed buffer's `size` is not
+ * guaranteed readable. Returns `bytes` so release paths can total what they
+ * gave back. Destroying twice would double-count, so every caller nulls its
+ * reference in the same step.
+ */
+function destroyTrackedBuffer(buffer: GPUBuffer, bytes: number, mem: MutableKernelMem | null): number {
+  if (freedBuffers.has(buffer)) return 0;
+  freedBuffers.add(buffer);
+  try {
+    buffer.destroy();
+  } catch {
+    /* already destroyed, or the device is gone: the memory is not ours either way */
+  }
+  deviceMem.held -= bytes;
+  deviceMem.freed += bytes;
+  deviceMem.buffers--;
+  if (mem) mem.freed += bytes;
+  return bytes;
+}
+
+/**
+ * Buffers already counted as freed. The counters are only worth asserting on
+ * if they cannot drift, and the one way they could is a buffer passing through
+ * `destroyTrackedBuffer` twice -- which a readback whose `mapAsync` rejects
+ * after its owner was torn down could otherwise do. Returning 0 for a repeat
+ * also keeps the `freed` totals release paths report honest.
+ */
+const freedBuffers = new WeakSet<GPUBuffer>();
+
+/**
+ * Device memory held by every kernel in this process, for tests, a memory HUD
+ * or a leak check after a level teardown. `heldBytes` returning to 0 after the
+ * last `world.dispose()` / `handle.destroy()` is the contract this exists to
+ * let you assert.
+ *
+ * Cheap (it reads five counters) and safe to call every frame.
+ */
+export function gpuDeviceMemory(): GPUDeviceMemory {
+  return {
+    heldBytes: deviceMem.held,
+    allocatedBytes: deviceMem.allocated,
+    freedBytes: deviceMem.freed,
+    buffers: deviceMem.buffers,
+    peakBytes: deviceMem.peak,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Per-archetype device state
 // ---------------------------------------------------------------------------
 
@@ -405,6 +564,16 @@ interface SharedTable {
   srcBuffer: ArrayBufferLike | null;
   /** `chunk.count` at the last upload. */
   lastCount: number;
+  /**
+   * `chunk.entities[0]` at the last upload, or -1 for an empty table. Guards the
+   * one case `srcBuffer` + `lastCount` miss: a table emptied and refilled to the
+   * same row count in the same buffer (`world.clear({ compact: false })`, or
+   * destroying every row of an archetype and respawning). Every refilled row
+   * belongs to a DIFFERENT handle, because the allocator bumps the generation it
+   * hands back, so row 0's handle changing means the rows are not the rows the
+   * device holds. Costs one Uint32Array read per chunk per dispatch.
+   */
+  lastEntity0: number;
   /** Forces the next dispatch to re-upload. */
   dirty: boolean;
   /**
@@ -447,6 +616,21 @@ export function residentTableCount(arch: Archetype): number {
   return byDevice ? byDevice.size : 0;
 }
 
+/**
+ * @internal Test seam: device bytes held by `arch`'s tables, over every device
+ * and every per-view-type copy. 0 means nothing of it is on a device right now,
+ * which is what {@link KernelRuntime.releaseUnused} leaves behind.
+ */
+export function residentTableBytes(arch: Archetype): number {
+  const byDevice = tableCache.get(arch);
+  if (!byDevice) return 0;
+  let bytes = 0;
+  for (const table of byDevice.values()) {
+    for (let i = 0; i < table.buffers.length; i++) if (table.buffers[i]) bytes += table.size;
+  }
+  return bytes;
+}
+
 /** One chunk's share of a batched readback. */
 interface ReadbackGroup {
   readonly state: ArchState;
@@ -457,6 +641,8 @@ interface ReadbackGroup {
   /** Stamps that must still hold when the map resolves, or the data is stale. */
   readonly srcBuffer: ArrayBufferLike;
   readonly count: number;
+  /** `arch.entities[0]` when this was encoded: see {@link SharedTable.lastEntity0}. */
+  readonly entity0: number;
   readonly generation: number;
 }
 
@@ -484,11 +670,128 @@ function alignUp(value: number, align: number): number {
   return (value + align - 1) - ((value + align - 1) % align);
 }
 
+/**
+ * Row 0's entity handle, or -1 for an empty table. The cheapest signal that a
+ * table's ROWS changed even though its buffer and row count did not: see
+ * {@link SharedTable.lastEntity0}.
+ */
+function firstHandle(arch: Archetype): number {
+  return arch.count > 0 ? arch.entities[0] : -1;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime registry (for flushKernels)
 // ---------------------------------------------------------------------------
 
 const tracked = new WeakMap<object, Map<string, Set<KernelRuntime>>>();
+
+/**
+ * Worlds whose disposal hook has already been attached, so registering ten
+ * kernels on one world attaches one hook. A WeakSet, so a world that is
+ * dropped without `dispose()` is still collectable -- NOTHING in this module
+ * holds a world strongly (see {@link KernelRuntime.destroy}).
+ */
+const hooked = new WeakSet<object>();
+
+/**
+ * The core's per-world disposal seam, duck-typed.
+ *
+ * `World.dispose()` must release the GPU runtimes attached to that world, and
+ * the core must not import anything from src/gpu to do it (the core bundle
+ * carries no GPU code -- that is checked). A module-level registry in the core
+ * cannot be the seam either: the core and `cozyecs/gpu` are two bundles, so
+ * each would get its own copy of it. The seam therefore lives ON THE WORLD
+ * INSTANCE, which both bundles already share: the GPU side registers a
+ * callback through `world._onDispose(fn)`, the core invokes the callbacks from
+ * `dispose()`, and neither names the other.
+ *
+ * Order inside `dispose()` does not matter: GPU teardown reads no world state
+ * and mutates none, so it is correct before or after the tables are deflated.
+ */
+interface DisposeHookHost {
+  /** @internal Registers `fn` to run during `dispose()`; may return an unregister fn. */
+  _onDispose?(fn: () => void): (() => void) | void;
+  dispose?(): void;
+}
+
+/**
+ * Attaches this world's GPU teardown to `world.dispose()`, once per world.
+ *
+ * The seam is `world._onDispose(fn)`, duck-typed rather than imported: importing
+ * a value from the core would bundle a second copy of it alongside this optional
+ * entry point (and with it a second component-id counter). A current core always
+ * has it, so that is the path taken.
+ *
+ * COMPATIBILITY SHIM: if `_onDispose` is absent -- an older core published before
+ * the seam existed -- and the world has a `dispose()` method, an own-property
+ * wrapper is installed around that one method so disposal still frees device
+ * memory instead of silently leaking it. The wrapper calls GPU teardown FIRST,
+ * then the original `dispose()`, and leaves the prototype untouched. It is a
+ * fallback for old cores, not the design; drop it when cozyecs < the seam's
+ * release is no longer supported.
+ *
+ * A world with neither `_onDispose` nor `dispose()` gets no hook. The app can
+ * still reclaim everything explicitly with {@link disposeWorldKernels} or
+ * per kernel with `handle.destroy()`.
+ */
+function attachDisposalHook(world: object): void {
+  if (hooked.has(world)) return;
+  hooked.add(world);
+  const host = world as DisposeHookHost;
+  const register = host._onDispose;
+  if (typeof register === 'function') {
+    try {
+      register.call(world, () => {
+        disposeWorldKernels(world);
+      });
+      return;
+    } catch (e) {
+      warn(`world._onDispose() threw (${(e as Error).message}); kernels will not be released by dispose().`);
+      return;
+    }
+  }
+  const dispose = host.dispose;
+  if (typeof dispose !== 'function') return;
+  Object.defineProperty(world, 'dispose', {
+    configurable: true,
+    writable: true,
+    enumerable: false,
+    value: function wrappedDispose(this: unknown): void {
+      disposeWorldKernels(world);
+      return dispose.call(this);
+    },
+  });
+}
+
+/**
+ * Destroys every kernel runtime attached to `world`, releasing its device
+ * buffers, staging buffers, bind groups and residency bookkeeping, and returns
+ * the device bytes freed. Further dispatches of those kernels are no-ops and
+ * their `sync()` promises resolve.
+ *
+ * Called by `world.dispose()` through the seam above; also exported so an app
+ * on a core without the seam -- or one that never calls `dispose()` -- can
+ * reclaim a world's device memory in one call. Idempotent, and a no-op for a
+ * world that never had a kernel.
+ *
+ * Does NOT touch the process-wide pipeline cache: pipelines are keyed by WGSL
+ * and shared across worlds, so the next world reuses them. `clearPipelineCache()`
+ * is the escape hatch if you want them gone too.
+ */
+export function disposeWorldKernels(world: unknown): number {
+  if (!world || typeof world !== 'object') return 0;
+  const groups = tracked.get(world as object);
+  if (!groups) return 0;
+  // destroy() calls back into trackRuntime(..., false), which mutates these
+  // sets, so snapshot first.
+  const runtimes: KernelRuntime[] = [];
+  for (const set of groups.values()) for (const runtime of set) runtimes.push(runtime);
+  const before = deviceMem.held;
+  for (let i = 0; i < runtimes.length; i++) runtimes[i].destroy();
+  tracked.delete(world as object);
+  const freed = before - deviceMem.held;
+  return freed > 0 ? freed : 0;
+}
 
 /**
  * @internal Registers a runtime so {@link flushKernels} can find it. Called by
@@ -511,6 +814,7 @@ export function trackRuntime(world: unknown, group: string, runtime: KernelRunti
     }
     set.add(runtime);
     runtime._trackedIn(key, group);
+    attachDisposalHook(key);
   } else if (set) {
     set.delete(runtime);
     if (set.size === 0) groups.delete(group);
@@ -600,7 +904,8 @@ export class KernelRuntime {
   private _target: KernelTarget;
   private readonly _thresholds: AutoThresholds;
   private readonly _stats: MutableStats;
-  private readonly _cpu: CompiledCPUKernel | null;
+  /** Nulled by {@link destroy}: the compiled loop holds its generated source. */
+  private _cpu: CompiledCPUKernel | null;
   private _cpuBrokenWarned: boolean;
   /** Why the CPU loop failed to compile, for the 'none' warning. */
   private _cpuError: string | null = null;
@@ -661,6 +966,10 @@ export class KernelRuntime {
   /** Scratch list of (state, rows) handed to `_encodeReadback`. */
   private readonly _readList: { state: ArchState; count: number }[];
   private _poolWarned: boolean;
+  /** Device-memory totals for this kernel; see {@link memory}. */
+  private readonly _mem: MutableKernelMem;
+  /** Run once by {@link destroy}; see {@link whenDestroyed}. */
+  private _onDestroyed: (() => void)[] | null;
 
   /** @internal Use {@link KernelRuntime.create}. */
   private constructor(
@@ -735,6 +1044,8 @@ export class KernelRuntime {
     this._rangeScratch = [];
     this._readList = [];
     this._poolWarned = false;
+    this._mem = { allocated: 0, freed: 0, uniform: 0, staging: 0 };
+    this._onDestroyed = [];
     const values = new Float64Array(ir.uniforms.length);
     for (let i = 0; i < ir.uniforms.length; i++) values[i] = ir.uniforms[i].initial;
     this.uniformValues = values;
@@ -1038,7 +1349,10 @@ export class KernelRuntime {
     for (let c = 0; c < chunks.length; c++) {
       const chunk = chunks[c];
       const count = chunk.count;
-      if (count === 0) continue;
+      if (count === 0) {
+        this._noteEmpty(chunk);
+        continue;
+      }
       const state = this._stateFor(chunk);
       this._ensureTable(state, chunk);
       this._upload(state, chunk, count);
@@ -1152,6 +1466,7 @@ export class KernelRuntime {
         ranges: ranges.slice(),
         srcBuffer: state.arch.buffer,
         count: list[i].count,
+        entity0: firstHandle(state.arch),
         generation: state.table.generation,
       });
       total += bytes;
@@ -1191,6 +1506,7 @@ export class KernelRuntime {
       const arch = state.arch;
       const table = state.table;
       if (table.srcBuffer !== arch.buffer || table.lastCount !== arch.count || arch.count === 0) continue;
+      if (table.lastEntity0 !== firstHandle(arch)) continue;
       let hasBuffers = true;
       for (let v = 0; v < this._views.length; v++) if (!this._bufferOf(table, v)) hasBuffers = false;
       if (!hasBuffers) continue;
@@ -1256,6 +1572,7 @@ export class KernelRuntime {
           !this._destroyed &&
           arch.buffer === group.srcBuffer &&
           arch.count === group.count &&
+          firstHandle(arch) === group.entity0 &&
           group.state.table.generation === group.generation;
         if (!fresh) {
           this._stats.staleReadbacks++;
@@ -1301,11 +1618,7 @@ export class KernelRuntime {
       this._readPool.push(buffer);
       return;
     }
-    try {
-      buffer.destroy();
-    } catch {
-      /* ignore */
-    }
+    this._mem.staging -= destroyTrackedBuffer(buffer, buffer.size, this._mem);
   }
 
   private _markCovered(upTo: number): void {
@@ -1351,6 +1664,27 @@ export class KernelRuntime {
   // Device-side bookkeeping
   // -------------------------------------------------------------------------
 
+  /**
+   * Called for every matching chunk a dispatch finds EMPTY. An empty table has
+   * no rows for the device to own, and the next refill may land on the same
+   * buffer with the same row count (`world.clear()`, or destroying every entity
+   * of an archetype and respawning), which the residency rules would read as
+   * "nothing changed". Marking it here closes that hole: the refill re-uploads.
+   *
+   * Also retires readbacks in flight for the table -- their rows are gone.
+   * Does nothing if the kernel has never dispatched over this archetype, and
+   * nothing on a table it has already marked, so it is free in steady state.
+   */
+  private _noteEmpty(arch: Archetype): void {
+    const state = this._states.get(arch.id);
+    if (!state || state.arch !== arch) return;
+    const table = state.table;
+    if (table.lastCount === 0) return;
+    table.lastCount = 0;
+    table.dirty = true;
+    table.generation++;
+  }
+
   private _stateFor(arch: Archetype): ArchState {
     let state = this._states.get(arch.id);
     if (!state || state.arch !== arch) {
@@ -1370,6 +1704,7 @@ export class KernelRuntime {
           size: 0,
           srcBuffer: null,
           lastCount: -1,
+          lastEntity0: -1,
           dirty: true,
           generation: 0,
           epoch: 0,
@@ -1398,33 +1733,30 @@ export class KernelRuntime {
 
     if (table.size < need) {
       // The table grew: every copy is the wrong size now.
-      for (let i = 0; i < table.buffers.length; i++) {
-        const b = table.buffers[i];
-        if (!b) continue;
-        try {
-          b.destroy();
-        } catch {
-          /* ignore */
-        }
-        table.buffers[i] = null;
-      }
+      dropTableBuffers(table, this._mem);
       table.size = need;
-      table.epoch++;
-      table.dirty = true;
-      table.sabStaging = null;
     } else if (table.srcBuffer !== chunk.buffer) {
-      // Same size class, reallocated source: re-upload, keep the buffers.
+      // Same size class, reallocated source: re-upload, keep the buffers. This
+      // is also the compaction case -- `Archetype.shrinkToFit` replaces the
+      // buffer and moves every column, and `_writeUniform` re-reads the field
+      // offsets and `_writtenRanges` the written ranges from the chunk's
+      // current views, so a device copy that is now LARGER than the table is
+      // simply oversized, never misread. `releaseUnused()` gives the slack back.
       table.dirty = true;
     }
 
     for (let v = 0; v < this._views.length; v++) {
       const slot = VIEW_ORDER.indexOf(this._views[v]);
       if (slot < 0 || table.buffers[slot]) continue;
-      table.buffers[slot] = device.createBuffer({
-        label: `cozy:arch${chunk.id}:${VIEW_ORDER[slot]}`,
-        size: table.size,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-      });
+      table.buffers[slot] = createTrackedBuffer(
+        device,
+        {
+          label: `cozy:arch${chunk.id}:${VIEW_ORDER[slot]}`,
+          size: table.size,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        },
+        this._mem,
+      );
       table.epoch++;
       // A copy created now holds nothing: the table has to be re-uploaded.
       table.dirty = true;
@@ -1435,7 +1767,8 @@ export class KernelRuntime {
   private _upload(state: ArchState, chunk: Archetype, count: number): void {
     const table = state.table;
     const src = chunk.buffer;
-    if (!table.dirty && table.srcBuffer === src && table.lastCount === count) return;
+    const first = firstHandle(chunk);
+    if (!table.dirty && table.srcBuffer === src && table.lastCount === count && table.lastEntity0 === first) return;
     const device = (this.context as GPUContext).device;
     const size = src.byteLength < table.size ? src.byteLength : table.size;
     const aligned = size - (size % 4);
@@ -1466,6 +1799,7 @@ export class KernelRuntime {
     }
     table.srcBuffer = src;
     table.lastCount = count;
+    table.lastEntity0 = first;
     table.dirty = false;
     table.generation++;
   }
@@ -1495,17 +1829,20 @@ export class KernelRuntime {
     this._uniF32 = new Float32Array(host.buffer);
     this._uniU32 = new Uint32Array(host.buffer);
     if (this._uniBuffer) {
-      try {
-        this._uniBuffer.destroy();
-      } catch {
-        /* ignore */
-      }
+      destroyTrackedBuffer(this._uniBuffer, this._mem.uniform, this._mem);
+      this._uniBuffer = null;
+      this._mem.uniform = 0;
     }
-    this._uniBuffer = device.createBuffer({
-      label: `cozy:${this.ir.name}:uniforms`,
-      size: capacity * stride,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    this._uniBuffer = createTrackedBuffer(
+      device,
+      {
+        label: `cozy:${this.ir.name}:uniforms`,
+        size: capacity * stride,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      },
+      this._mem,
+    );
+    this._mem.uniform = capacity * stride;
     this._uniCapacity = capacity;
     // Every bind group referenced the old buffer.
     for (const other of this._states.values()) other.bindGroups.length = 0;
@@ -1628,23 +1965,22 @@ export class KernelRuntime {
     if (this._readBusy >= MAX_READBACKS_IN_FLIGHT) return null;
     // Nothing reusable: drop an undersized idle buffer to bound the pool.
     const idle = this._readPool.pop();
-    if (idle) {
-      try {
-        idle.destroy();
-      } catch {
-        /* ignore */
-      }
-    }
+    if (idle) this._mem.staging -= destroyTrackedBuffer(idle, idle.size, this._mem);
     let buffer: GPUBuffer;
     try {
-      buffer = device.createBuffer({
-        label: `cozy:${this.ir.name}:readback`,
-        size: need,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
+      buffer = createTrackedBuffer(
+        device,
+        {
+          label: `cozy:${this.ir.name}:readback`,
+          size: need,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        },
+        this._mem,
+      );
     } catch {
       return null;
     }
+    this._mem.staging += need;
     this._readBusy++;
     return buffer;
   }
@@ -1681,36 +2017,40 @@ export class KernelRuntime {
     }
   }
 
-  private _releaseDeviceState(): void {
+  /**
+   * Gives back every device buffer this kernel holds and resets the
+   * bookkeeping that named them. Returns the bytes released.
+   *
+   * Staging buffers IN FLIGHT are not in `_readPool` -- a `mapAsync` owns them
+   * -- so they are not destroyed here. They drain through `_finishReadback`
+   * into `_releaseReadBuffer`, which destroys rather than pools them once
+   * `_destroyed`/`_degraded` is set, and the accounting follows them there.
+   * `destroy()` sets `_destroyed` before calling this, so that path is armed.
+   */
+  private _releaseDeviceState(): number {
+    const before = deviceMem.held;
     for (const state of this._states.values()) {
       state.bindGroups.length = 0;
       state.slotBase = -1;
       state.slots = 0;
       state.bindEpoch = -1;
-      releaseTable(state.table);
+      releaseTable(state.table, this._mem);
     }
     this._states.clear();
     if (this._uniBuffer) {
-      try {
-        this._uniBuffer.destroy();
-      } catch {
-        /* ignore */
-      }
+      destroyTrackedBuffer(this._uniBuffer, this._mem.uniform, this._mem);
+      this._uniBuffer = null;
     }
-    this._uniBuffer = null;
+    this._mem.uniform = 0;
     this._uniCapacity = 0;
     this._uniNext = 0;
     this._uniHost = null;
     this._uniF32 = null;
     this._uniU32 = null;
-    for (const b of this._readPool) {
-      try {
-        b.destroy();
-      } catch {
-        /* ignore */
-      }
-    }
+    for (const b of this._readPool) this._mem.staging -= destroyTrackedBuffer(b, b.size, this._mem);
     this._readPool.length = 0;
+    const freed = before - deviceMem.held;
+    return freed > 0 ? freed : 0;
   }
 
   /**
@@ -1750,11 +2090,131 @@ export class KernelRuntime {
   }
 
   /**
+   * Frees the device memory this kernel is holding but no longer needs, and
+   * returns the bytes released. The GPU-side counterpart to `world.compact()`:
+   * MECHANISM, never policy -- nothing calls it for you, and a tick never does.
+   * Call it between ticks, after a `compact()`/`clear()` or after a level
+   * teardown, not every frame.
+   *
+   * An archetype's device table is released when:
+   *   - the archetype is EMPTY (`count === 0`): dispatches skip it, so its
+   *     device copy is dead weight;
+   *   - its `chunk.buffer` was REPLACED since the last upload (compaction, or
+   *     any growth not yet picked up): the device copy no longer describes the
+   *     table;
+   *   - the device copy is OVERSIZED for the table's current byte length, which
+   *     is what compaction leaves behind. Dispatching stays correct with an
+   *     oversized copy; this is the call that gives the slack back.
+   * Returning 0 means there was nothing to reclaim. The readback staging pool is
+   * deliberately left alone: it is bounded at {@link MAX_READBACKS_IN_FLIGHT}
+   * buffers, it exists to stop per-frame allocation, and destroying it here
+   * would make a between-level reclaim cost the next frames their pool.
+   *
+   * The archetype objects, their ids, this kernel's uniform slot reservations
+   * and every query's cached chunk list all survive: only device buffers go.
+   * Residency bookkeeping is dropped with them, so the next dispatch over a
+   * released archetype recreates the buffers at the size the table needs now
+   * and re-uploads from the CPU table -- which is why this must not be called
+   * while the GPU is the owner of unread results. Under `readback: 'none'` the
+   * device copy IS the data: releasing it discards every write since the first
+   * dispatch. `await sync()` first under `'async'`/`'sync-frame'`.
+   *
+   * Device tables are shared between kernels over the same archetype, so the
+   * bytes are reported by whichever kernel releases them first; a second
+   * kernel's call then finds nothing and returns 0. No-op on the CPU backend,
+   * after `destroy()`, and after a degrade.
+   */
+  releaseUnused(): number {
+    if (this._destroyed || this._degraded || this.context === null) return 0;
+    let freed = 0;
+    for (const state of this._states.values()) {
+      const table = state.table;
+      const arch = state.arch;
+      if (table.size === 0) continue;
+      const raw = arch.buffer.byteLength;
+      const need = raw < 4 ? 4 : alignUp(raw, 4);
+      const empty = arch.count === 0;
+      const replaced = table.srcBuffer !== null && table.srcBuffer !== arch.buffer;
+      const oversized = need < table.size;
+      if (!empty && !replaced && !oversized) continue;
+      freed += dropTableBuffers(table, this._mem);
+      // The bind groups named buffers that no longer exist; `table.epoch`
+      // already invalidated them for every kernel, this just drops ours now.
+      state.bindGroups.length = 0;
+      state.bindEpoch = -1;
+    }
+    return freed;
+  }
+
+  /**
+   * Device memory this kernel is holding, and what it has allocated and freed
+   * over its life. Counts BUFFERS only -- tables, the uniform buffer and the
+   * readback staging pool; pipelines and bind groups hold no buffer memory and
+   * are cached process-wide.
+   *
+   * `heldBytes` is 0 on the CPU backend, after `destroy()` and after the
+   * world's `dispose()`. It is NOT 0 after `releaseUnused()` unless every
+   * archetype was releasable: the uniform buffer and the staging pool survive
+   * that call on purpose.
+   *
+   * Shared tables are reported by every kernel sharing them, so these numbers
+   * do not sum across kernels. {@link gpuDeviceMemory} is the process-wide,
+   * non-double-counted total.
+   */
+  memory(): KernelMemory {
+    let tableBytes = 0;
+    let tables = 0;
+    for (const state of this._states.values()) {
+      const table = state.table;
+      let live = 0;
+      for (let i = 0; i < table.buffers.length; i++) if (table.buffers[i]) live++;
+      if (live === 0) continue;
+      tables++;
+      tableBytes += live * table.size;
+    }
+    const mem = this._mem;
+    return {
+      heldBytes: tableBytes + mem.uniform + mem.staging,
+      tableBytes,
+      uniformBytes: mem.uniform,
+      stagingBytes: mem.staging,
+      tables,
+      allocatedBytes: mem.allocated,
+      freedBytes: mem.freed,
+    };
+  }
+
+  /** True once {@link destroy} has run, or the world's `dispose()` did it for us. */
+  get destroyed(): boolean {
+    return this._destroyed;
+  }
+
+  /**
+   * @internal Runs `fn` when this runtime is destroyed, however that happens --
+   * `handle.destroy()`, `world.removeSystem()` or `world.dispose()` through
+   * {@link disposeWorldKernels}. Runs it immediately if that already happened.
+   *
+   * index.ts uses it to drop the `world` and `query` its handle closures
+   * captured, so a handle the app is still holding cannot keep a disposed
+   * world's archetypes alive. Callbacks must not throw.
+   */
+  whenDestroyed(fn: () => void): void {
+    if (this._destroyed) {
+      fn();
+      return;
+    }
+    (this._onDestroyed as (() => void)[]).push(fn);
+  }
+
+  /**
    * The GPUBuffer holding `archetype`'s table on the device, for rendering
    * straight out of it with `readback: 'none'`. Null when the archetype has
    * never been dispatched or the kernel is on the CPU backend. The buffer is
-   * REPLACED when the archetype grows -- re-fetch it after structural changes,
-   * exactly like a column TypedArray.
+   * REPLACED when the archetype grows and FREED by {@link releaseUnused} --
+   * re-fetch it after structural changes, exactly like a column TypedArray.
+   * Note that it is NOT replaced by a `world.compact()`: the device copy is
+   * reused at its old size, but every field's byte offset inside it moved with
+   * the CPU table, so re-read `chunk.col(C)[field].byteOffset` as well.
    *
    * Field offsets inside it are `chunk.col(C)[field].byteOffset`, the same as
    * on the CPU side: the buffer is a byte-for-byte image of the table.
@@ -1767,17 +2227,34 @@ export class KernelRuntime {
   }
 
   /**
-   * Releases every GPU buffer and drops the pipeline references. Called by
-   * `world.removeSystem` through the handle. Safe to call twice. Pending
-   * readbacks are abandoned (their `sync()` promises still resolve).
+   * Releases every GPU buffer and drops every reference this kernel holds.
+   * Called by `world.removeSystem` through the handle, and by `world.dispose()`
+   * through {@link disposeWorldKernels}. Safe to call twice; returns the device
+   * bytes freed. Pending readbacks are abandoned (their `sync()` promises still
+   * resolve, and their staging buffers are destroyed as they drain).
+   *
+   * AFTER THIS THE RUNTIME HOLDS NOTHING COLLECTABLE: no world (`_trackedAt`),
+   * no archetype (`_states`), no compiled CPU loop and no WGSL module. That
+   * matters because the handle the app may still be holding references this
+   * runtime, so anything the runtime keeps alive, the handle keeps alive.
+   * `dispatch()` returns immediately from here on.
    */
-  destroy(): void {
-    if (this._destroyed) return;
+  destroy(): number {
+    if (this._destroyed) return 0;
     this._destroyed = true;
-    this._releaseDeviceState();
+    const freed = this._releaseDeviceState();
     this._pipeline = null;
+    this._module = null;
+    // The compiled loop holds its generated source text, and the WGSL module
+    // its own; neither is reachable again.
+    this._cpu = null;
     for (const t of this._trackedAt) trackRuntime(t.world, t.group, this, false);
     this._trackedAt.length = 0;
+    // Scratch that names ArchStates, which name archetypes.
+    this._touched.length = 0;
+    this._touchedCount = 0;
+    this._readList.length = 0;
+    this._rangeScratch.length = 0;
     // In-flight readbacks (including a catch-up) drain into _finishReadback,
     // which destroys their staging buffers and touches no table.
     this._catchUpNeeded = false;
@@ -1786,6 +2263,18 @@ export class KernelRuntime {
     const waiters = this._waiters.slice();
     this._waiters.length = 0;
     for (let i = 0; i < waiters.length; i++) waiters[i].resolve();
+    const after = this._onDestroyed;
+    this._onDestroyed = null;
+    if (after) {
+      for (let i = 0; i < after.length; i++) {
+        try {
+          after[i]();
+        } catch {
+          /* a cleanup callback must not break teardown */
+        }
+      }
+    }
+    return freed;
   }
 }
 
@@ -1805,24 +2294,44 @@ function poolSize(bytes: number): number {
   return size;
 }
 
-/** Drops one kernel's hold on a shared table, freeing it when the last goes. */
-function releaseTable(table: SharedTable): void {
-  if (--table.refs > 0) return;
+/**
+ * Destroys a shared table's device copies and resets its residency bookkeeping,
+ * WITHOUT dropping any kernel's hold on it. Returns the bytes released.
+ *
+ * `epoch` is bumped because every kernel's bind groups name the destroyed
+ * buffers, and `generation` because any readback in flight was copied out of
+ * them: both must be re-made, and both checks already exist on the dispatch and
+ * apply paths. `size = 0` makes the next `_ensureTable` allocate for the
+ * table's CURRENT byte length, which is how compaction reaches the device.
+ *
+ * Destroying a buffer that submitted commands still reference is legal: WebGPU
+ * defers the deallocation until those commands complete, and the readback that
+ * was reading it is discarded by the `generation` stamp rather than by the map
+ * failing.
+ */
+function dropTableBuffers(table: SharedTable, mem: MutableKernelMem | null): number {
+  let freed = 0;
   for (let i = 0; i < table.buffers.length; i++) {
     const b = table.buffers[i];
     if (!b) continue;
-    try {
-      b.destroy();
-    } catch {
-      /* ignore */
-    }
     table.buffers[i] = null;
+    freed += destroyTrackedBuffer(b, table.size, mem);
   }
   table.size = 0;
   table.srcBuffer = null;
   table.lastCount = -1;
+  table.lastEntity0 = -1;
   table.dirty = true;
+  table.sabStaging = null;
+  table.generation++;
   table.epoch++;
+  return freed;
+}
+
+/** Drops one kernel's hold on a shared table, freeing it when the last goes. */
+function releaseTable(table: SharedTable, mem: MutableKernelMem | null): void {
+  if (--table.refs > 0) return;
+  dropTableBuffers(table, mem);
   const byDevice = tableCache.get(table.arch);
   if (byDevice) {
     byDevice.delete(deviceTag(table.device));

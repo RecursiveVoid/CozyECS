@@ -13,6 +13,9 @@
 >   skips disabled rows exactly (§3.6).
 > - **`f64` fields are computed in f32** on both backends, with a one-time
 >   warning per kernel (§2.5).
+> - **Device memory is never reclaimed for you.** Device buffers follow the CPU
+>   tables and only grow; `kernel.releaseUnused()` gives back what an emptied or
+>   compacted archetype left behind (§3.9).
 
 Write a system as a plain JavaScript function. CozyECS reads that function, turns
 it into WGSL, and runs it on the GPU — or compiles it to a tight CPU loop when
@@ -156,7 +159,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 Field offsets are in **elements** of that field's view, taken from the live
 typed array (`view.byteOffset / view.BYTES_PER_ELEMENT`) every frame, because a
-table that grows is reallocated and every offset moves. Bind-group *offsets*
+table that grows — or that `world.compact()` shrinks — is reallocated and every
+offset moves. Bind-group *offsets*
 must be 256-byte aligned and a field column is not, which is the second reason
 offsets live in the uniform rather than in the binding.
 
@@ -464,6 +468,14 @@ A kernel cannot spawn, destroy, add or remove — the subset has no way to expre
 it, so there is nothing to defer and no command buffer involvement. Do structural
 work in an ordinary system before or after the kernel's group.
 
+Growth, compaction and `world.clear()` are all handled on the dispatch path: the
+table's buffer identity and row count are part of the residency check, so a
+replaced or resized table is re-uploaded before the next dispatch reads it. That
+re-upload comes from the CPU table, so under `readback: 'none'` it **overwrites
+whatever the GPU had computed** — see the warning in
+[§3.9](#39-device-memory-releaseunused), which also covers giving the device
+bytes back.
+
 ### 3.8 Pairwise kernels (experimental)
 
 ```js
@@ -494,6 +506,172 @@ Two v1 restrictions:
 - **Writes to `other` are rejected.** Every pair is evaluated by both
   participants, so a write to `other` would race. Accumulate into `self` only;
   the symmetric half happens when the roles swap.
+
+---
+
+### 3.9 Device memory: `releaseUnused()`
+
+Device buffers follow the CPU tables, and like them they only ever grow on their
+own. A table that is emptied, or deflated by `world.compact()` / `world.clear()`,
+leaves its device copy behind at the high-water-mark size. `releaseUnused()`
+gives those bytes back:
+
+```js
+// Between ticks, after a level teardown -- not every frame.
+await kernel.sync();                   // anything unread is discarded with the buffers
+world.clear();                         // every entity gone, every table deflated
+world.compact({ strings: true });
+const bytes = kernel.releaseUnused();  // device bytes released
+```
+
+It destroys the device copies of every archetype this kernel has dispatched over
+that is now **empty**, whose table **ArrayBuffer was replaced** by a compaction,
+or whose copy is now **oversized**, and returns the bytes released. The residency
+bookkeeping goes with them, so the next dispatch recreates the buffers at the
+size the table needs now and re-uploads from the CPU table.
+
+- **Mechanism only.** Nothing calls it for you, a tick never does, and
+  dispatching is *correct* without it — just at high-water-mark device memory.
+- **`await sync()` first** under `'async'` / `'sync-frame'`. Under
+  `readback: 'none'` the device copy **is** the data: releasing it discards every
+  write since the first dispatch.
+- Device tables are **shared between kernels** over the same archetype, so the
+  bytes are reported by whichever kernel releases them first; a second kernel's
+  call then finds nothing and returns 0.
+- Returns 0 on the CPU backend, after a degrade, and after `destroy()`.
+- The staging-buffer pool for readbacks is **not** destroyed: it exists to stop
+  per-frame allocation, and a between-level reclaim should not cost the next
+  frames their pool.
+
+A compaction alone needs no call at all — the normal dispatch path notices the
+replaced buffer and re-uploads, and a device copy that is now larger than the
+table is simply oversized, never misread. `releaseUnused()` is how you stop
+paying for that slack.
+
+> **Under `readback: 'none'`, a compaction costs you the GPU-resident state.**
+> The device copy is the only copy in that mode, and `world.compact()` replaces
+> the table's `ArrayBuffer` — which is one of the residency triggers in
+> [§3.2](#32-who-owns-the-data), so the next dispatch re-uploads from the
+> **stale** CPU table and every write since the first dispatch is gone. Measured
+> on Dawn: five dispatches of `p.x += 1` leave the device at `x = 5` and the CPU
+> table at `0`; after `world.compact()` and one more dispatch the device reads
+> `1`, not `6`. The same is true of a table that *grows*, and of
+> `releaseUnused()` itself. So under `'none'`, either keep the authoritative
+> state on the GPU and accept the reset, or switch that archetype to `'async'`
+> for the frame in which you reclaim — and do the reclaiming at a point where
+> losing the simulation state is the intent anyway, such as a level teardown.
+
+`handle.memory()` is how you check what a `releaseUnused()` actually gave back, and
+`gpuDeviceMemory()` is the process-wide total: see [§3.10](#310-measuring-device-memory-handlememory-and-gpudevicememory).
+
+`bufferFor(archetype)` is **not** replaced by a `world.compact()`: the device
+copy is reused at its old size, but every field's byte offset inside it moved
+with the CPU table, so re-read `chunk.col(C)[field].byteOffset` after any
+structural change — and re-read `bufferFor` itself after `releaseUnused()`, which
+frees it.
+
+### 3.10 Measuring device memory: `handle.memory()` and `gpuDeviceMemory()`
+
+Neither heap meter JavaScript has can see a GPU buffer: Chrome's `performance.memory` excludes
+`ArrayBuffer`s entirely, and node's `process.memoryUsage().arrayBuffers` only counts host memory.
+A device buffer that is never destroyed is therefore invisible to every ordinary measurement — so
+this module keeps its own census. Every `GPUBuffer` it creates and every one it destroys goes
+through one pair of helpers, which makes "the device memory came back" a number rather than a
+hope.
+
+```js
+const m = kernel.memory();
+m.heldBytes;       // tableBytes + uniformBytes + stagingBytes: what this kernel keeps alive
+m.tableBytes;      // archetype table copies
+m.uniformBytes;    // this kernel's one uniform buffer
+m.stagingBytes;    // readback staging buffers, pooled and in flight
+m.tables;          // archetype tables with at least one live device copy
+m.allocatedBytes;  // cumulative, this kernel (a shared table counts for its creator)
+m.freedBytes;      // cumulative, this kernel
+```
+
+Measured on Dawn (node 22.14 / Apple M4), one `Position + Velocity` kernel over 8,000 entities
+with `readback: 'async'` and `target: 'gpu'` (at this size `'auto'` picks the CPU backend, which
+holds no device memory at all), after a single dispatch:
+
+```
+heldBytes 293120 = tableBytes 160000 + uniformBytes 2048 + stagingBytes 131072   (tables: 1)
+```
+
+**These numbers do not sum across kernels.** A device table is shared by every kernel dispatching
+over that archetype, and each of them reports it. For the process-wide truth — and for the
+assertion a leak test should make — use the census:
+
+```js
+const g = gpuDeviceMemory();
+g.heldBytes;       // bytes in GPUBuffers that exist right now
+g.allocatedBytes;  // cumulative, monotonic
+g.freedBytes;      // allocatedBytes - freedBytes === heldBytes, always
+g.buffers;         // GPUBuffers alive right now
+g.peakBytes;       // high-water mark of heldBytes
+```
+
+It reads five counters, so it is cheap enough for a memory HUD every frame. Pipelines, shader
+modules and bind groups are deliberately **not** counted: they hold no buffer memory and are
+cached process-wide by design, so a pipeline surviving a world is not a leak.
+
+`heldBytes` is `0` on the CPU backend, `0` after `handle.destroy()`, and `0` after the world's
+`dispose()` — those are the three ways it is meant to come back.
+
+### 3.11 Disposing a world
+
+`world.dispose()` releases the GPU side too. You do not call anything: `cozyecs/gpu` attaches its
+teardown to a world the first time a kernel is registered on it, so disposing the world destroys
+every kernel runtime attached to it — device tables, the uniform buffer, the staging pool, bind
+groups and the residency bookkeeping — and the census returns to where it was before the world
+existed. The core bundle still contains no GPU code; the seam is described in
+[INTERNALS.md](INTERNALS.md#world-teardown-worldts-gpuruntimets).
+
+```js
+const world = new World();
+const move = await kernelSystem(world, 'Move', { target: 'gpu', /* ... */ });
+world.update(1 / 60);
+await move.sync();
+
+gpuDeviceMemory().heldBytes;   // 293120 for the 8,000-entity kernel above
+world.dispose();
+gpuDeviceMemory().heldBytes;   // 0
+```
+
+Measured: eight build → dispatch → `dispose()` cycles over 8,000 entities ended at `heldBytes 0`
+and `buffers 0`, with `peakBytes` 426,240 — one cycle's worth, never eight.
+
+After the world is disposed, the kernel handle is inert and safe:
+
+| call on a handle whose world was disposed | behaviour |
+|---|---|
+| `handle.memory().heldBytes` | `0` |
+| `handle.releaseUnused()` | returns `0` |
+| `await handle.sync()` | resolves immediately |
+| `handle.destroy()` | safe and idempotent; it skips `removeSystem`, which a disposed world would throw on |
+
+A handle that outlives its world holds **neither the world nor its query** — both references are
+dropped when the runtime is destroyed, by whichever route — so keeping a dead handle around
+cannot keep a disposed world alive.
+
+Two narrower levers for the same thing:
+
+```js
+handle.destroy();              // one kernel: unregisters the system and frees its GPU resources
+disposeWorldKernels(world);    // every kernel of one world, without disposing the world
+```
+
+`handle.destroy()` is idempotent, and dispatches after it are no-ops: measured, one kernel's
+destroy brought the census straight back to baseline. `disposeWorldKernels(world)` returns the
+device bytes it freed (measured 426,240 B for two kernels sharing one 8,000-entity archetype),
+returns `0` on a second call and `0` for a world that never had a kernel. It is the call to reach
+for when you want the device memory back but intend to keep using the world: the kernel systems
+stay registered and keep running, their dispatches are no-ops, and the next `world.update()`
+allocates nothing on the device (verified).
+
+The process-wide pipeline cache is *not* touched by any of this: pipelines are keyed by WGSL and
+shared across worlds, so the next world reuses them instead of recompiling. They hold no buffer
+memory, which is why they are absent from the census as well.
 
 ---
 
@@ -843,9 +1021,14 @@ kernelSystem(world, name, {
 //   ir, readback, stats,
 //   backend: 'gpu' | 'cpu' | 'none',   // 'none': no usable backend (§5)
 //   sync(), setUniform(name, v), getUniform(name),
-//   markCpuDirty(archetype?), bufferFor(archetype), destroy() }
+//   markCpuDirty(archetype?), bufferFor(archetype),
+//   releaseUnused(): number,           // frees device buffers compaction left behind (§3.9)
+//   memory(): KernelMemory,            // this kernel's device bytes (§3.10)
+//   destroy() }
 
 flushKernels(world, group?): Promise<void>
+gpuDeviceMemory(): GPUDeviceMemory    // process-wide device-buffer census (§3.10)
+disposeWorldKernels(world): number    // free every kernel of one world; returns bytes (§3.11)
 setAutoThresholds({ fireAndForget?, synchronous? }): void
 getAutoThresholds(): AutoThresholds  // what kernels created from now on will use
 calibrateAuto(core, { sizes?, frames?, repeats?, apply? }?): Promise<CalibrationResult | null>
@@ -862,6 +1045,9 @@ describeIR(ir), IR_VERSION, BUILTINS, WORKGROUP_SIZE   // introspection
 
 `kernelSystem` is asynchronous because acquiring a device is. Register kernels
 during startup, before the first `world.update()`.
+
+Exported types include `KernelMemory`, `GPUDeviceMemory`, `KernelTarget`, `KernelBackend`,
+`ReadbackMode`, `KernelStats` and `AutoThresholds`.
 
 ---
 

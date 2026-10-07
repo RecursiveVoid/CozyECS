@@ -558,7 +558,12 @@ function callTrampoline(t: Trampoline): boolean {
   return t();
 }
 
-/** Reused one-element chunk list for per-chunk generic fallbacks (read once per loop). */
+/**
+ * Reused one-element chunk list for per-chunk generic fallbacks (read once per loop).
+ * MUST be emptied again by whoever fills it: this is module-level state, and a chunk left
+ * behind here would keep that archetype -- and through its transition edges its whole world's
+ * tables -- reachable for the life of the process (see `runPlan`).
+ */
 const ONE_CHUNK: Archetype[] = [];
 
 /** Generic forEachChunk loop (no codegen, fresh callbacks, shape bound reached). */
@@ -608,6 +613,9 @@ function runPlan(plan: ChunkPlan, chunks: Archetype[], ids: Int32Array): void {
       ONE_CHUNK[0] = chunks[c];
       if (plan.kind === KIND_CHUNK) forEachChunkGeneric(ONE_CHUNK, plan.comps, plan.fn as AnyChunkFn);
       else forEachRows(ONE_CHUNK, ids, plan.comps, plan.fn as AnyForEachFn);
+      // Drop the chunk again: see ONE_CHUNK. One store per fallback chunk, off the fast path
+      // (a trampoline was unavailable here anyway).
+      ONE_CHUNK.length = 0;
     }
   }
 }
@@ -1010,12 +1018,14 @@ export class Query {
    * last enter/exit listener is removed.
    */
   onEnter(cb: EntityCallback): Unsubscribe {
+    this.world._assertNotDisposed('query.onEnter');
     this._enter = appendListener(this._enter, cb);
     return this._subscribed(cb, true);
   }
 
   /** Like onEnter, fired after an entity stops matching (destroy / move out). */
   onExit(cb: EntityCallback): Unsubscribe {
+    this.world._assertNotDisposed('query.onExit');
     this._exit = appendListener(this._exit, cb);
     return this._subscribed(cb, false);
   }
@@ -1037,6 +1047,26 @@ export class Query {
     // Read the listener array once; unsubscribing during dispatch replaces it (copy-on-write).
     const list = wasIn ? this._exit : this._enter;
     for (let i = 0; i < list.length; i++) list[i](entity);
+  }
+
+  /**
+   * @internal Final teardown, called by `World.dispose` for every query of the world. Drops the
+   * matching archetypes, the enter/exit listeners and the cached loop / chunk plan -- the plan's
+   * trampolines close over the chunks' column arrays, so a query the app still holds would
+   * otherwise keep the disposed world's table buffers alive.
+   *
+   * The query object stays usable in the read-only sense: `count()` is 0, `forEach` /
+   * `forEachChunk` iterate nothing, `matches()` still answers from the masks.
+   */
+  _dispose(): void {
+    this.chunks.length = 0;
+    this._enter = EMPTY_LISTENERS;
+    this._exit = EMPTY_LISTENERS;
+    this._listenerCount = 0;
+    this._loopFn = null;
+    this._loopM = -1;
+    this._loop = forEachRows;
+    this._plan = null;
   }
 
   /** @internal Bumps the listener count, notifies the world on 0 -> 1, returns unsubscribe. */

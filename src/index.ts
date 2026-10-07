@@ -1,5 +1,14 @@
-export { World } from './world';
-export type { WorldOptions, SpawnInitFn } from './world';
+export { World, registerWorldDisposeHook } from './world';
+export type {
+  WorldOptions,
+  WorldDisposeHook,
+  SpawnInitFn,
+  ArchetypeMemory,
+  WorldMemory,
+  CompactOptions,
+  CompactStats,
+  ClearOptions,
+} from './world';
 export { System } from './system';
 export type { SystemHandle, SystemOptions, FunctionSystemOptions, SystemFn, SystemClass } from './system';
 export { component, tag } from './component';

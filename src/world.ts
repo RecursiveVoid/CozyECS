@@ -1,4 +1,4 @@
-import { Archetype } from './archetype';
+import { Archetype, capacityFor } from './archetype';
 import { componentsKey, maskHas, normalizeComponents } from './component';
 import type { ComponentType } from './component';
 import { EntityAllocator, HIGH_BITS, INDEX_BITS, INDEX_MASK, LOCATION_FREE, LOCATION_PENDING, TAG_BIG, TAG_PENDING } from './entities';
@@ -23,6 +23,80 @@ export interface WorldOptions {
 
 /** Init callback for spawnMany: `row` is the new row in `chunk`, `i` is 0..count-1. */
 export type SpawnInitFn = (chunk: Archetype, row: number, i: number) => void;
+
+/** One archetype's storage, as reported by `World.memory`. */
+export interface ArchetypeMemory {
+  /** Archetype id (index in the world's archetype list). */
+  id: number;
+  /** Component names, in ascending component id order. */
+  components: string[];
+  /** Live rows. */
+  count: number;
+  /** Allocated rows. */
+  capacity: number;
+  /** Bytes of table storage per row (entities + fields + enabled flags). */
+  rowBytes: number;
+  /** Bytes of the archetype's table buffer (`capacity * rowBytes`, rounded up to 8). */
+  bytes: number;
+}
+
+/**
+ * Storage snapshot returned by `World.memory`. All sizes are bytes of ECS-owned storage:
+ * typed-array tables, the entity index and the string table's count. JS object overhead
+ * (archetype descriptors, queries, systems, interned string contents) is not included.
+ */
+export interface WorldMemory {
+  /** Live entities (pending ones included). */
+  entities: number;
+  /** Table bytes: `used` is `count * rowBytes` summed, `reserved` is the buffers' byteLength. */
+  tables: { used: number; reserved: number };
+  /** Bytes held by the entity allocator's per-index arrays and its free list. */
+  entityIndex: number;
+  /** String table size (interned strings, including `''`). */
+  strings: { count: number };
+  /** `tables.reserved + entityIndex`. */
+  total: number;
+  /** Per archetype, in id order. */
+  archetypes: ArchetypeMemory[];
+}
+
+/** Options for `World.compact`. */
+export interface CompactOptions {
+  /**
+   * Also rebuild the string table, dropping strings no live row references. Interned ids are
+   * NOT stable across this: every `str` column is rewritten in the same pass, so ids held
+   * OUTSIDE the world (from `world.strings.intern`, or read with `getField`) go stale.
+   * Default false.
+   */
+  strings?: boolean;
+  /**
+   * Skip an archetype unless deflating it would free at least this many bytes, so compaction
+   * never churns tables that are nearly full. Default 4096.
+   */
+  minBytes?: number;
+}
+
+/** What `World.compact` did. */
+export interface CompactStats {
+  /** Archetypes whose table was reallocated. */
+  archetypes: number;
+  /** Table bytes released. */
+  bytesFreed: number;
+  /** Present only with `{ strings: true }`: string table size before and after. */
+  strings?: { before: number; after: number };
+}
+
+/** Options for `World.clear`. */
+export interface ClearOptions {
+  /**
+   * Fire `onRemove` hooks and query `onExit` listeners for every destroyed entity. Default
+   * FALSE: the fast path fires NOTHING, which is the point of it. Turn it on when listeners
+   * own external resources keyed by entity.
+   */
+  events?: boolean;
+  /** Deflate every table to a zero-length buffer afterwards. Default true. */
+  compact?: boolean;
+}
 
 // Command op codes (plain consts, not const enum, for isolatedModules/ts-jest).
 /** @internal */ export const CMD_SPAWN = 0; // ents=entity, ref=archetype id
@@ -124,6 +198,18 @@ export class CommandBuffer {
     this.length = len - n;
   }
 
+  /**
+   * @internal Drops the commands AND the capacity (`World.dispose`). Unlike `clear()` this is
+   * not reusable: the buffer keeps zero-length arrays, which `push` would immediately regrow.
+   */
+  _release(): void {
+    this.clear();
+    this.codes = EMPTY_I32;
+    this.ents = EMPTY_U32;
+    this.slots = EMPTY_I32;
+    this.vals.length = 0;
+  }
+
   private _grow(): void {
     const cap = this.codes.length * 2;
     const codes = new Int32Array(cap);
@@ -138,7 +224,69 @@ export class CommandBuffer {
   }
 }
 
+const EMPTY_I32 = new Int32Array(0);
+const EMPTY_U32 = new Uint32Array(0);
+const EMPTY_U8 = new Uint8Array(0);
+
 const DEFAULT_CAPACITY = 64;
+
+// ---------------------------------------------------------------------------
+// Teardown seam
+// ---------------------------------------------------------------------------
+
+/**
+ * Teardown callback run by {@link World.dispose}, for resources attached to a world that the
+ * core knows nothing about.
+ *
+ * It is called with the world still fully readable -- entities, archetypes and systems are
+ * intact -- so a hook can walk the world before the core releases its storage. It must not
+ * mutate the world: every mutating entry point already throws at this point.
+ */
+export type WorldDisposeHook = (world: World) => void;
+
+/**
+ * Hooks, in registration order. Module-level, and deliberately holding nothing but functions:
+ * an optional module registers ONE hook at import time and finds its own per-world state
+ * through its own (weakly keyed) tables, so nothing here can keep a world alive.
+ */
+const disposeHooks: WorldDisposeHook[] = [];
+
+/**
+ * Registers a {@link WorldDisposeHook} run by every later `World.dispose()`.
+ *
+ * This is the seam that lets `cozyecs/gpu` release the GPU runtimes of a world without the core
+ * importing any GPU code (the core bundle still contains none): the GPU module registers one
+ * hook when it is imported, and looks its runtimes up in its own `WeakMap` keyed by the world.
+ * Engines can use it for the same purpose with their own per-world resources.
+ *
+ * A hook that throws does not abort the teardown: the world is disposed completely either way
+ * and the first error is rethrown by `dispose()` afterwards.
+ *
+ * @returns a function that unregisters the hook (idempotent).
+ */
+export function registerWorldDisposeHook(hook: WorldDisposeHook): () => void {
+  if (typeof hook !== 'function') throw new TypeError('CozyECS: registerWorldDisposeHook(hook) needs a function');
+  disposeHooks.push(hook);
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    const at = disposeHooks.indexOf(hook);
+    if (at !== -1) disposeHooks.splice(at, 1);
+  };
+}
+
+/** @internal Number of registered dispose hooks (for tests). */
+export function _disposeHookCount(): number {
+  return disposeHooks.length;
+}
+
+/** The one error every call that needs a live world throws after `dispose()`. */
+function disposedError(method: string): Error {
+  return new Error(
+    `CozyECS: world.${method}() is not available after world.dispose(); the world has been torn down (create a new World).`,
+  );
+}
 
 /**
  * The ECS world: owns entities, archetypes, queries, systems and the command buffer.
@@ -169,6 +317,8 @@ export class World {
   _onRemove: (EntityCallback[] | undefined)[];
   /** @internal Total number of onAdd + onRemove listeners (0 => skip all hook dispatch). */
   _hookCount: number;
+  /** @internal Per-world dispose callbacks registered through {@link _onDispose}; null until used. */
+  _disposeCallbacks: Array<() => void> | null;
   /** @internal `_hookCount !== 0 || _eventQueries.length !== 0` (kept in sync; one load on hot paths). */
   _hasEvents: boolean;
   /** @internal Nesting depth of forEach / system runs. */
@@ -195,6 +345,8 @@ export class World {
   readonly _edgeAdd: (Archetype | undefined)[][];
   /** @internal Array mirror of `edgesRemove` (self-edge when the component is absent). */
   readonly _edgeRemove: (Archetype | undefined)[][];
+  /** @internal Set by dispose(); see the `disposed` getter. */
+  _disposed: boolean;
 
   constructor(options?: WorldOptions) {
     const requested = options && options.initialCapacity;
@@ -214,6 +366,7 @@ export class World {
     this._onAdd = [];
     this._onRemove = [];
     this._hookCount = 0;
+    this._disposeCallbacks = null;
     this._hasEvents = false;
     this._iterDepth = 0;
     this._flushing = false;
@@ -226,6 +379,7 @@ export class World {
     this._cmdComponent = null;
     this._edgeAdd = [[]];
     this._edgeRemove = [[]];
+    this._disposed = false;
     const empty = new Archetype(0, [], '', cap, this._shared);
     this._archetypes.push(empty);
     this._archetypeByKey.set('', empty);
@@ -236,6 +390,7 @@ export class World {
 
   /** Get-or-create the archetype for this component set (order/duplicates ignored). */
   archetype(...components: ComponentType[]): Archetype {
+    if (this._disposed) throw disposedError('archetype');
     return this._getOrCreateArchetype(components);
   }
 
@@ -247,6 +402,7 @@ export class World {
    * the placement.
    */
   spawn(archetypeOrComponents?: Archetype | ComponentType[]): number {
+    if (this._disposed) throw disposedError('spawn');
     let arch: Archetype;
     if (archetypeOrComponents === undefined) {
       arch = this._emptyArchetype;
@@ -267,6 +423,7 @@ export class World {
 
   /** Creates `count` entities in `archetype`, growing storage once. Deferred while iterating. */
   spawnMany(archetype: Archetype, count: number, init?: SpawnInitFn): void {
+    if (this._disposed) throw disposedError('spawnMany');
     this._checkArchetype(archetype);
     count = Math.floor(count);
     if (!(count > 0)) return;
@@ -279,7 +436,11 @@ export class World {
 
   /** Destroys an entity. Silently ignored if dead. Deferred while iterating. */
   destroy(entity: number): void {
-    if (!this._entities.isAlive(entity)) return;
+    if (!this._entities.isAlive(entity)) {
+      // Dead handles are ignored, but on a disposed world EVERY handle is dead: say so instead.
+      if (this._disposed) throw disposedError('destroy');
+      return;
+    }
     if (this._iterDepth > 0 || this._flushing) {
       this._commands.push(CMD_DESTROY, entity, 0);
     } else {
@@ -381,6 +542,7 @@ export class World {
 
   /** add() for entities that are dead (throws), pending or in a big-id archetype. */
   private _addSlow(entity: number, C: ComponentType, values: Record<string, unknown> | undefined): void {
+    if (this._disposed) throw disposedError('add');
     if (this._entities.locate(entity) === LOCATION_FREE) {
       throw new Error(`CozyECS: add(${C.name}) on dead entity ${entity}`);
     }
@@ -395,6 +557,7 @@ export class World {
 
   /** remove() for entities that are dead (ignored), pending or in a big-id archetype. */
   private _removeSlow(entity: number, C: ComponentType): void {
+    if (this._disposed) throw disposedError('remove');
     const aid = this._entities.locate(entity);
     if (aid === LOCATION_FREE) return;
     if (this._iterDepth > 0 || this._flushing) {
@@ -419,6 +582,7 @@ export class World {
     const alloc = this._entities;
     const aid = alloc.locate(entity);
     if (aid === LOCATION_FREE) {
+      if (this._disposed) throw disposedError('set');
       throw new Error(`CozyECS: set(${C.name}) on dead entity ${entity}`);
     }
     const idx = entity & INDEX_MASK;
@@ -474,10 +638,12 @@ export class World {
    * @throws Error if `C` is not enableable, or the entity is dead or lacks `C`.
    */
   enable(entity: number, C: ComponentType, on: boolean = true): void {
+    if (this._disposed) throw disposedError('enable');
     if (!C.enableable) throw new Error(`CozyECS: component ${C.name} is not enableable`);
     const alloc = this._entities;
     const aid = alloc.locate(entity);
     if (aid === LOCATION_FREE) {
+      if (this._disposed) throw disposedError('enable');
       throw new Error(`CozyECS: enable(${C.name}) on dead entity ${entity}`);
     }
     const idx = entity & INDEX_MASK;
@@ -505,11 +671,13 @@ export class World {
 
   /** Fires after `C` is added to an entity (add, spawn, spawnMany). */
   onAdd(C: ComponentType, cb: EntityCallback): () => void {
+    if (this._disposed) throw disposedError('onAdd');
     return this._subscribeHook(this._onAdd, C.id, cb);
   }
 
   /** Fires after `C` is removed from an entity (remove, destroy). Data is no longer readable. */
   onRemove(C: ComponentType, cb: EntityCallback): () => void {
+    if (this._disposed) throw disposedError('onRemove');
     return this._subscribeHook(this._onRemove, C.id, cb);
   }
 
@@ -517,6 +685,7 @@ export class World {
 
   /** Get-or-create a cached query. */
   query(desc: QueryDesc): Query {
+    if (this._disposed) throw disposedError('query');
     const key = Query.keyOf(desc);
     const cached = this._queryByKey.get(key);
     if (cached !== undefined) return cached;
@@ -530,6 +699,7 @@ export class World {
 
   /** Registers a function system. */
   system(name: string, options: FunctionSystemOptions, fn: SystemFn): SystemHandle {
+    if (this._disposed) throw disposedError('system');
     const opts = options || {};
     const qOpt = opts.query;
     const q = qOpt === undefined || qOpt === null ? undefined : qOpt instanceof Query ? qOpt : this.query(qOpt);
@@ -548,6 +718,7 @@ export class World {
 
   /** Instantiates and registers a class system, then calls onCreate(). */
   addSystem<T extends System>(SystemCtor: SystemClass<T>, options?: SystemOptions): T {
+    if (this._disposed) throw disposedError('addSystem');
     const s = new SystemCtor(this);
     s.name = s.name || SystemCtor.name || 'System';
     s.group = options && options.group !== undefined ? options.group : 'update';
@@ -574,7 +745,10 @@ export class World {
   update(dt: number = 0, group: string = 'update'): void {
     const list = this._scheduler.group(group);
     const n = list.length;
-    if (n === 0) return;
+    if (n === 0) {
+      if (this._disposed) throw disposedError('update');
+      return;
+    }
     const base = this._iterDepth;
     const cmds = this._commands;
     // One try/finally for the whole group (not per system). `_iterDepth !== base` in the
@@ -626,6 +800,381 @@ export class World {
       // On throw: drop applied commands and the failing one, keep the rest queued.
       // `_flushCursor` is the index of the command being applied (set before applying it).
       if (cmds.length > 0) cmds._dropFront(this._flushCursor + 1);
+    }
+  }
+
+  // ------------------------------------------------------------------ memory
+
+  /**
+   * Snapshot of the storage this world owns: live entities, per-archetype table bytes, the
+   * entity index, and the string table's size. Diagnostic, so it ALLOCATES (one result object
+   * plus one entry and name list per archetype): call it from a debug overlay or a test, never
+   * per frame in hot code.
+   *
+   * `tables.used` vs `tables.reserved` is the slack `compact()` can reclaim.
+   */
+  memory(): WorldMemory {
+    const archs = this._archetypes;
+    const list: ArchetypeMemory[] = [];
+    let used = 0;
+    let reserved = 0;
+    for (let i = 0; i < archs.length; i++) {
+      const a = archs[i];
+      const rowBytes = a.rowBytes;
+      const bytes = a.buffer.byteLength;
+      const comps = a.components;
+      const names: string[] = [];
+      for (let k = 0; k < comps.length; k++) names.push(comps[k].name);
+      used += a.count * rowBytes;
+      reserved += bytes;
+      list.push({ id: a.id, components: names, count: a.count, capacity: a.capacity, rowBytes, bytes });
+    }
+    const alloc = this._entities;
+    const entityIndex = alloc.slot.byteLength + alloc.bigAid.byteLength + alloc.freeStack.byteLength;
+    return {
+      entities: alloc.aliveCount,
+      tables: { used, reserved },
+      entityIndex,
+      strings: { count: this.strings.size },
+      total: reserved + entityIndex,
+      archetypes: list,
+    };
+  }
+
+  /**
+   * Returns unused table rows to the allocator: every archetype is deflated to the capacity
+   * the growth policy would have reached for its live row count (0 for an empty one), so the
+   * next spawn does not immediately re-grow it.
+   *
+   * MECHANISM, not policy: nothing calls this on a tick, there is no background or heuristic
+   * GC, and no entity references are traced. The engine decides WHEN to reclaim -- typically
+   * after a level teardown or a wave of destroys. Archetype objects, their ids, masks, keys,
+   * transition edges and query `chunks` membership all survive; only buffers are replaced, so
+   * cached column views must be re-fetched (systems already re-fetch per tick).
+   *
+   * Live entities keep their component values, their enabled bits and their handles.
+   *
+   * @param options `minBytes` (default 4096) skips archetypes with less slack than that, so
+   *   compaction never churns; `strings: true` also rebuilds the string table and RENUMBERS
+   *   interned ids (see `CompactOptions.strings`).
+   * @throws Error when called during iteration (inside a system or a `forEach`), while a flush
+   *   is running, or while structural commands are still queued.
+   */
+  compact(options?: CompactOptions): CompactStats {
+    this._assertBetweenTicks('compact');
+    const minBytesOpt = options === undefined ? undefined : options.minBytes;
+    const minBytes = typeof minBytesOpt === 'number' && minBytesOpt === minBytesOpt ? minBytesOpt : 4096;
+    const archs = this._archetypes;
+    const initial = this._initialCapacity;
+    let touched = 0;
+    let bytesFreed = 0;
+    for (let i = 0; i < archs.length; i++) {
+      const a = archs[i];
+      const cap = a.capacity;
+      const target = a.count === 0 ? 0 : capacityFor(a.count, initial);
+      if (target >= cap) continue; // never grow, and nothing to do when already exact
+      if ((cap - target) * a.rowBytes < minBytes) continue;
+      const before = a.buffer.byteLength;
+      if (!a.shrinkToFit(target)) continue;
+      touched++;
+      bytesFreed += before - a.buffer.byteLength;
+    }
+    const stats: CompactStats = { archetypes: touched, bytesFreed };
+    if (options !== undefined && options.strings === true) stats.strings = this._compactStrings();
+    return stats;
+  }
+
+  /**
+   * Destroys every entity in ONE pass: table counts are reset, every live index is returned to
+   * the allocator with its generation bumped (so handles taken before the call stay dead and
+   * `isAlive` keeps answering correctly), and -- unless `compact: false` -- every table is
+   * deflated to a zero-length buffer.
+   *
+   * By default NO EVENTS FIRE: `onRemove` hooks and query `onExit` listeners are skipped
+   * entirely, because skipping the per-entity work is the point of this fast path. If a
+   * listener releases something the ECS does not own (a sprite, a socket, a GPU resource), pass
+   * `{ events: true }` or tear those down yourself before calling.
+   *
+   * Archetypes, queries, systems, component registrations, transition edges and the string
+   * table all survive; spawning works immediately afterwards and queries report 0 until it
+   * happens.
+   *
+   * @param options `events: true` fires `onRemove` / `onExit` per entity with the same ordering
+   *   rules as `destroy()` (hooks in component id order, then query exits), after every row has
+   *   been removed; `compact: false` keeps the table capacities for an imminent refill.
+   * @throws Error when called during iteration (inside a system or a `forEach`), while a flush
+   *   is running, or while structural commands are still queued.
+   */
+  clear(options?: ClearOptions): void {
+    this._assertBetweenTicks('clear');
+    const fireEvents = options !== undefined && options.events === true;
+    const deflate = !(options !== undefined && options.compact === false);
+    const archs = this._archetypes;
+    const alloc = this._entities;
+
+    // Snapshot (entity, owning archetype) pairs BEFORE anything is reset; `_fireEvents` only
+    // needs the handle and the archetype's mask, so firing afterwards is safe.
+    let ents: Uint32Array | null = null;
+    let owners: Archetype[] | null = null;
+    if (fireEvents && alloc.aliveCount > 0) {
+      const list = new Uint32Array(alloc.aliveCount);
+      const by: Archetype[] = [];
+      let w = 0;
+      for (let i = 0; i < archs.length; i++) {
+        const a = archs[i];
+        const es = a.entities;
+        for (let r = 0, n = a.count; r < n; r++) {
+          if (w === list.length) break; // defensive: never write past the snapshot
+          list[w++] = es[r];
+          by.push(a);
+        }
+      }
+      ents = list.subarray(0, w);
+      owners = by;
+    }
+
+    // Rows must still be in place: releaseAll reads each placed entity's generation from its row.
+    alloc.releaseAll();
+    for (let i = 0; i < archs.length; i++) archs[i].count = 0;
+
+    if (ents !== null && owners !== null) {
+      for (let k = 0; k < ents.length; k++) this._fireEvents(ents[k], owners[k], null);
+    }
+    // Listeners may have spawned; shrinkToFit keeps whatever rows exist now.
+    if (deflate) {
+      for (let i = 0; i < archs.length; i++) archs[i].shrinkToFit(0);
+    }
+  }
+
+  // ------------------------------------------------------------------ teardown
+
+  /** True once {@link dispose} has run. A disposed world is inert and cannot be revived. */
+  get disposed(): boolean {
+    return this._disposed;
+  }
+
+  /**
+   * Final teardown of the WHOLE world, the level above `destroy()` (one entity),
+   * `removeSystem()` (one system) and `clear()` (the contents). Releases everything attached to
+   * the world so that dropping the last reference to it makes the world, its archetypes and
+   * their ArrayBuffers collectable:
+   *
+   *  1. every registered {@link WorldDisposeHook} runs FIRST, while the world is still fully
+   *     readable -- this is how `cozyecs/gpu` releases the kernel runtimes (and their GPU
+   *     buffers) of this world without the core importing any GPU code;
+   *  2. every system is unregistered (all groups emptied) and then `onDestroy()` is called on
+   *     class systems in reverse registration order -- the scheduler is already empty, so an
+   *     `onDestroy` that calls `removeSystem(this)` is a no-op and nothing is destroyed twice;
+   *  3. every cached query drops its matching archetypes, its `onEnter`/`onExit` listeners and
+   *     its compiled loop / chunk plan (whose trampolines hold the chunks' column arrays);
+   *  4. `onAdd` / `onRemove` listeners are dropped;
+   *  5. pending structural commands are DISCARDED WITHOUT RUNNING (nothing queued is applied);
+   *  6. every archetype table is deflated to capacity 0 and its transition edges and row plans
+   *     are cleared, then the archetype list itself is emptied;
+   *  7. the entity index is released, which is what makes every handle report dead;
+   *  8. the view cache, the component registry and the interned strings are dropped.
+   *
+   * Idempotent: a second call does nothing. There is no module-level registry of worlds, so
+   * nothing but your own references keeps a disposed world alive.
+   *
+   * COMPONENTS ARE NOT PER-WORLD RESOURCES and are deliberately not touched: a `component()`
+   * descriptor is process-global, its id is baked into archetype masks, and it is meant to be
+   * shared by every world in the process. There is nothing to dispose on one.
+   *
+   * AFTER DISPOSE, the rule is: every call that would mutate the world throws an Error naming
+   * `dispose()` -- `spawn`, `spawnMany`, `destroy`, `add`, `remove`, `set`, `enable`, `archetype`,
+   * `query`, `onAdd`, `onRemove`, `system`, `addSystem`, `update`, `compact`, `clear`, and
+   * `Query.onEnter` / `Query.onExit`. Every read-only call stays safe and answers for an empty
+   * world: `isAlive` is false for every handle, `has` false, `get` undefined, `memory()` is all
+   * zeros (bar the string table's structural `''`), `query.count()` is 0 and `forEach` iterates
+   * nothing. Teardown calls stay no-ops: `dispose()`, `removeSystem()`, `flush()`, and
+   * unsubscribe functions handed out earlier.
+   *
+   * @throws Error when called during iteration (inside a system or a `forEach`) or while a flush
+   *   is running -- unlike `compact()` / `clear()` it does NOT require an empty command queue,
+   *   since discarding it is the point. A hook or an `onDestroy` that throws does not abort the
+   *   teardown: the world is disposed completely and the first error is rethrown afterwards.
+   */
+  /**
+   * @internal Registers `fn` to run when THIS world is disposed, before anything is torn
+   * down. Returns an unregister function. This is the seam optional entry points use
+   * (`cozyecs/gpu` releases its device buffers through it): they duck-type this method
+   * rather than importing {@link registerWorldDisposeHook}, because importing a value from
+   * the core would bundle a second copy of it alongside the optional module.
+   * A callback that throws does not stop disposal; the first error is rethrown at the end.
+   */
+  _onDispose(fn: () => void): () => void {
+    if (typeof fn !== 'function') throw new TypeError('CozyECS: _onDispose(fn) needs a function');
+    const list = this._disposeCallbacks ?? (this._disposeCallbacks = []);
+    list.push(fn);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      const at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  }
+
+  dispose(): void {
+    if (this._disposed) return;
+    if (this._iterDepth > 0 || this._flushing) {
+      throw new Error('CozyECS: world.dispose() cannot run during iteration; call it between ticks.');
+    }
+    this._disposed = true;
+
+    let failure: unknown = null;
+    let failed = false;
+
+    // 1. Hooks, with the world still intact so they can walk it.
+    for (let i = 0; i < disposeHooks.length; i++) {
+      try {
+        disposeHooks[i](this);
+      } catch (e) {
+        if (!failed) {
+          failed = true;
+          failure = e;
+        }
+      }
+    }
+
+    // 1b. Per-world callbacks (the seam optional modules such as `cozyecs/gpu` use: they
+    // cannot import this module's functions as values without bundling a second copy of
+    // the core). Same contract as the global hooks: the world is still intact here.
+    const callbacks = this._disposeCallbacks;
+    if (callbacks !== null) {
+      for (let i = 0; i < callbacks.length; i++) {
+        try {
+          callbacks[i]();
+        } catch (e) {
+          if (!failed) {
+            failed = true;
+            failure = e;
+          }
+        }
+      }
+      this._disposeCallbacks = null;
+    }
+
+    // 2. Systems: unregister everything first, then onDestroy (last registered first).
+    const systems = this._scheduler.drain();
+    for (let i = 0; i < systems.length; i++) {
+      const s = systems[i];
+      s.enabled = false;
+      if (s instanceof System) {
+        try {
+          s.onDestroy();
+        } catch (e) {
+          if (!failed) {
+            failed = true;
+            failure = e;
+          }
+        }
+      }
+    }
+
+    // 3. Queries (their plans hold the tables' column arrays).
+    const queries = this._queries;
+    for (let i = 0; i < queries.length; i++) queries[i]._dispose();
+    queries.length = 0;
+    this._queryByKey.clear();
+    this._eventQueries = [];
+
+    // 4. Component hooks.
+    this._onAdd.length = 0;
+    this._onRemove.length = 0;
+    this._hookCount = 0;
+    this._hasEvents = false;
+
+    // 5. Pending commands: discarded, never applied.
+    this._commands._release();
+    this._flushCursor = 0;
+
+    // 6. Tables. `_archetypes` is the array the EntityAllocator holds, so emptying it here is
+    // also what makes the allocator's liveness checks unable to reach a table.
+    const archs = this._archetypes;
+    for (let i = 0; i < archs.length; i++) archs[i]._dispose();
+    archs.length = 0;
+    this._archetypeByKey.clear();
+    this._edgeAdd.length = 0;
+    this._edgeRemove.length = 0;
+
+    // 7. Entity index: after this every handle is dead (next === 0).
+    this._entities.dispose();
+
+    // 8. Caches and interned strings. `_rebuild` with an empty keep-set leaves only id 0 ('').
+    this._views.length = 0;
+    this._components.length = 0;
+    this._cmdComponent = null;
+    this.strings._rebuild(EMPTY_U8);
+
+    if (failed) throw failure;
+  }
+
+  /** @internal Throws {@link disposedError} when this world has been disposed. */
+  _assertNotDisposed(method: string): void {
+    if (this._disposed) throw disposedError(method);
+  }
+
+  /**
+   * Rebuilds the string table around the ids live rows actually reference, then rewrites every
+   * `str` column with the new ids. Two passes over the `str` columns of live rows.
+   */
+  private _compactStrings(): { before: number; after: number } {
+    const table = this.strings;
+    const before = table.size;
+    const keep = new Uint8Array(before);
+    this._forEachStrColumn((col, n) => {
+      for (let r = 0; r < n; r++) {
+        const id = col[r];
+        if (id < keep.length) keep[id] = 1;
+      }
+    });
+    const remap = table._rebuild(keep);
+    const limit = remap.length;
+    this._forEachStrColumn((col, n) => {
+      for (let r = 0; r < n; r++) {
+        const id = col[r];
+        col[r] = id < limit ? remap[id] : 0;
+      }
+    });
+    return { before, after: table.size };
+  }
+
+  /** Calls `fn(column, count)` for every `str` column that has at least one live row. */
+  private _forEachStrColumn(fn: (col: TypedArray, count: number) => void): void {
+    const archs = this._archetypes;
+    for (let i = 0; i < archs.length; i++) {
+      const a = archs[i];
+      const n = a.count;
+      if (n === 0) continue;
+      const comps = a.components;
+      for (let ci = 0; ci < comps.length; ci++) {
+        const C = comps[ci];
+        const cols = a.columns[C.id];
+        if (cols === undefined) continue;
+        const keys = C.keys;
+        const tokens = C.tokens;
+        for (let k = 0; k < keys.length; k++) {
+          if (tokens[k].code !== FIELD_STR) continue;
+          fn(cols[keys[k]], n);
+        }
+      }
+    }
+  }
+
+  /** Throws unless the world is between ticks: not iterating, not flushing, no queued commands. */
+  private _assertBetweenTicks(method: string): void {
+    if (this._disposed) throw disposedError(method);
+    if (this._iterDepth > 0 || this._flushing) {
+      throw new Error(`CozyECS: world.${method}() cannot run during iteration; call it between ticks.`);
+    }
+    const pending = this._commands.length;
+    if (pending !== 0) {
+      throw new Error(
+        `CozyECS: world.${method}() cannot run during iteration; call it between ticks. ` +
+          `(${pending} structural command${pending === 1 ? '' : 's'} still queued; call world.flush() first.)`,
+      );
     }
   }
 

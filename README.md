@@ -120,6 +120,9 @@ world.update(1 / 60); // dispatches with the other systems and never blocks
 and a CPU/GPU switch, with a live view of the archetype's memory layout, the systems running each tick,
 entity memory, and five tracked entities whose values are read back from GPU memory. At 1M particles on an Apple M4, the CPU backend uses ~15–20 ms of main-thread
 time per frame; the GPU backend uses ~0.04 ms and draws straight from the kernel's buffer.
+The panel also reports used vs reserved bytes live, and **Clear + compact** runs the whole reclaim
+round trip in front of you — `world.clear()`, `world.compact()`, `kernel.releaseUnused()`, then a
+respawn into the same archetype and the same cached query.
 
 The GPU module is **experimental**: its API may change in a minor release. The subset grammar,
 error codes, readback modes and break-even tables are in [docs/GPU.md](docs/GPU.md).
@@ -165,15 +168,23 @@ npm run build && npm run benchmark -- --paired --repeats=5
   system are queued and applied in a batch after it.
 - **Compiled loops.** `forEachChunk` and CPU kernels generate a loop in which V8 treats the column
   arrays as constants.
+- **Memory you can give back.** `world.memory()` shows used vs reserved bytes; `world.compact()`
+  deflates the tables, `world.clear()` empties the world in one pass, `world.dispose()` tears the
+  whole world down (device buffers included, through a hook), and `kernel.releaseUnused()` frees
+  the device copies. Mechanism only — nothing runs on a tick, and there is no background GC.
+- **Measured, not asserted.** A dropped world is collectable without `dispose()`: over 20
+  build/run/drop cycles `process.memoryUsage().arrayBuffers` grows 0 bytes per cycle, with or
+  without it (`npm run test:leak`). `dispose()` is how you get the bytes back *now* — see
+  [the teardown ladder](docs/GUIDE.md#the-teardown-ladder-destroy-removesystem-clear-dispose).
 
 ## Documentation
 
 | | |
 |---|---|
 | [Guide](docs/GUIDE.md) | Concepts, the full API reference, performance tips and limits |
-| [Queries and systems](docs/API.md) | Chunks, the three iteration styles and how `forEach` is optimized |
+| [Queries, systems and memory](docs/API.md) | Chunks, the three iteration styles, how `forEach` is optimized, and measuring and reclaiming memory |
 | [GPU kernels](docs/GPU.md) | The kernel subset, readback modes, choosing a target, error codes |
-| [Internals](docs/INTERNALS.md) | Storage layout, entity handles, the command buffer, compiled loops |
+| [Internals](docs/INTERNALS.md) | Storage layout, entity handles, the command buffer, compiled loops, what allocates |
 | [Benchmark results](benchmarks/RESULTS.md) | Every table, the methodology and the fairness audit |
 
 ## Development
@@ -181,7 +192,9 @@ npm run build && npm run benchmark -- --paired --repeats=5
 ```bash
 npm ci
 npm run typecheck
-npm test               # 387 tests: unit, reference-model fuzz, GPU parser, codegen and parity
+npm test               # 481 tests: unit, reference-model fuzz, memory, GPU parser, codegen, parity
+npm run test:alloc     # the "a tick allocates nothing" guard (needs --expose-gc)
+npm run test:leak      # the build/run/dispose/drop leak measurements (needs --expose-gc)
 npm run build
 npm run benchmark      # CPU suite vs 13 library variants
 npm run benchmark:gpu  # CPU vs GPU from 1k to 1M entities

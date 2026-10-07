@@ -66,6 +66,7 @@ export function makeEntity(index: number, generation: number): number {
 }
 
 const EMPTY_I32 = new Int32Array(0);
+const EMPTY_I16 = new Int16Array(0);
 
 export class EntityAllocator {
   /** Packed (tag << 20) | low per index (see file header). */
@@ -140,6 +141,51 @@ export class EntityAllocator {
     this.freeStack[n] = index;
     this.freeCount = n + 1;
     this.aliveCount--;
+  }
+
+  /**
+   * Frees EVERY live index in one pass (the bulk form of `release`, for `World.clear`).
+   * Each index -- placed or pending -- is tagged TAG_FREE with its generation BUMPED, so every
+   * handle handed out before the call stays dead and `isAlive` keeps answering correctly;
+   * already-free indices keep the generation they had. All indices [0, next) end up on the
+   * free stack in descending order, so `create` hands them back out from index 0 upwards.
+   *
+   * MUST be called while the archetype tables still hold their rows: the generation of a
+   * PLACED entity lives in `archetypes[aid].entities[row]`, not in `slot`. Reset the table
+   * counts (and deflate the tables) only afterwards.
+   *
+   * The per-index arrays are not shrunk (`next` is unchanged), so a world that is cleared and
+   * refilled never reallocates them.
+   * @returns the number of entities freed.
+   */
+  releaseAll(): number {
+    const slot = this.slot;
+    const n = this.next;
+    let free = this.freeStack;
+    if (free.length < n) {
+      free = new Int32Array(n < 64 ? 64 : n);
+      this.freeStack = free;
+    }
+    const freed = this.aliveCount;
+    let w = 0;
+    for (let index = n - 1; index >= 0; index--) {
+      const s = slot[index];
+      const tag = s >>> INDEX_BITS;
+      let gen: number;
+      if (tag === TAG_FREE) {
+        gen = s & GENERATION_MASK; // already free: keep the generation it will hand out
+      } else if (tag === TAG_PENDING) {
+        gen = ((s & GENERATION_MASK) + 1) & GENERATION_MASK;
+      } else {
+        const aid = tag < TAG_BIG ? tag : this.bigAid[index];
+        gen = ((this.archetypes[aid].entities[s & INDEX_MASK] >>> INDEX_BITS) + 1) & GENERATION_MASK;
+      }
+      slot[index] = (TAG_FREE << INDEX_BITS) | gen;
+      free[w++] = index;
+    }
+    this.freeCount = w;
+    this.aliveCount = 0;
+    return freed;
   }
 
   /**
@@ -234,6 +280,23 @@ export class EntityAllocator {
       big.set(this.bigAid);
       this.bigAid = big;
     }
+  }
+
+  /**
+   * @internal Releases every per-index array (`World.dispose`). Afterwards `next` is 0, so
+   * `locate` answers LOCATION_FREE for EVERY handle without touching `archetypes` -- which is
+   * what keeps `world.isAlive()` safe on a disposed world whose archetype list is empty.
+   *
+   * Not a reset: the allocator is not reusable afterwards (the World guards every entry point
+   * that would call `create`), it is emptied so nothing it held stays reachable.
+   */
+  dispose(): void {
+    this.slot = EMPTY_I32;
+    this.bigAid = EMPTY_I16;
+    this.freeStack = EMPTY_I32;
+    this.freeCount = 0;
+    this.next = 0;
+    this.aliveCount = 0;
   }
 
   private _growFree(): void {

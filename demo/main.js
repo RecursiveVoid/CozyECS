@@ -47,7 +47,7 @@ const ui = {
   fps: $('fps'), ms: $('ms'), n: $('n'), be: $('be'), autoNote: $('autoNote'),
   calibrate: $('calibrate'), reset: $('reset'), banner: $('banner'), hint: $('hint'), src: $('src'),
   backend: $('backend'), count: $('count'),
-  mem: $('mem'), bpe: $('bpe'), memNote: $('memNote'),
+  mem: $('mem'), bpe: $('bpe'), memNote: $('memNote'), reclaim: $('reclaim'), reclaimNote: $('reclaimNote'),
   overlay: $('overlay'), layout: $('layout'), archmeta: $('archmeta'), tick: $('tick'), watch: $('watch'), watchsrc: $('watchsrc'),
 };
 const overlayCtx = ui.overlay.getContext('2d');
@@ -88,10 +88,39 @@ const state = {
   ctx2d: null,
   pointer: { active: false, x: 0, y: 0 },
   tick: 0,
+  // Simulation clock in seconds: the sum of the dt actually handed to the kernel.
+  // Marker extrapolation measures sample age against this, not wall time, so a
+  // frame-rate dip (dt is clamped to 1/30) cannot make it overshoot.
+  simTime: 0,
   times: { particles: 0, watch: 0, render: 0 },
   // A few entities we follow on screen and in the panel.
-  watch: { rows: [], ents: [], samples: new Float32Array(20), trails: [], busy: false, staging: null, src: '' },
+  watch: {
+    rows: [],
+    ents: [],
+    samples: new Float32Array(20), // the newest sample: x, y, vx, vy per marker
+    incoming: new Float32Array(20), // scratch for one arriving readback
+    pos: new Float32Array(10), // what we draw this frame: extrapolated x, y
+    trails: [],
+    hasSample: false,
+    sampleTime: 0, // the simTime the sample in `samples` belongs to
+    seq: 0,
+    lastSeq: 0,
+    pool: [], // rotating staging buffers: { buf, pending, dead, seq, simTime, tick, wall }
+    ageFrames: 0, // ema, for the panel
+    ageSec: 0, // ema of the same age in seconds, caps the extrapolation
+    src: '',
+    // Honest before/after numbers; see cozyDemo.markerStats().
+    diag: { samples: 0, ageFrames: 0, ageMs: 0, rawPx: 0, extraPx: 0 },
+  },
+  mem: null, // last world.memory() snapshot (or an estimate), refreshed with the panel
+  reclaimNote: '',
+  reclaiming: false,
+  disposed: 0, // worlds torn down so far (one per rebuild after the first)
 };
+
+// Live knobs so the two fixes can be measured against the old behaviour:
+// cozyDemo.markerTuning.pool = 1; cozyDemo.markerTuning.extrapolate = false;
+const markerTuning = { pool: 3, extrapolate: true };
 
 function rng(seed) {
   let a = seed >>> 0;
@@ -104,28 +133,103 @@ function rng(seed) {
   };
 }
 
+/** Fills an (empty) archetype with n particles on a spinning disc. */
+function spawnParticles(world, arch, n) {
+  const r = rng(7);
+  world.spawnMany(arch, n, (chunk, row) => {
+    const p = chunk.col(Position);
+    const v = chunk.col(Velocity);
+    // A disc around the center, spinning.
+    const a = r() * Math.PI * 2;
+    const d = Math.sqrt(r()) * 0.7;
+    const x = Math.cos(a) * d, y = Math.sin(a) * d;
+    p.x[row] = x;
+    p.y[row] = y;
+    v.vx[row] = -y * 0.9 + (r() - 0.5) * 0.05;
+    v.vy[row] = x * 0.9 + (r() - 0.5) * 0.05;
+  });
+}
+
+/**
+ * Hands one world's memory back, completely, before the next one is built.
+ *
+ * Every backend or count switch builds a fresh World, so without this the page
+ * would keep the old one alive through `state` AND through the GPU objects that
+ * name its buffers -- a bind group holds its storage buffer, and the staging
+ * buffers hold device memory the JS heap never shows. Order matters: the demo's
+ * own references go first, then the kernel's device copies, then the world.
+ *
+ * Returns the `world.memory().total` of the world that was released, or 0.
+ */
+function teardown() {
+  const world = state.world, handle = state.handle;
+  const was = world ? memorySnapshot() : null;
+
+  // 1. What the demo itself holds. The staging buffers read the kernel's
+  //    storage buffer; the bind group and `boundBuffer` name it directly; the
+  //    CPU-backend upload buffer is sized for the old table, so a 1M -> 10k
+  //    switch would otherwise strand its device memory for the whole session.
+  releasePool();
+  const g = state.gpu;
+  if (g) {
+    g.bindGroup = null;
+    g.boundBuffer = null;
+    if (g.cpuBuf) {
+      try {
+        g.cpuBuf.destroy();
+      } catch {
+        /* already gone */
+      }
+      g.cpuBuf = null;
+    }
+  }
+  resetWatch();
+  state.mem = null;
+  state.handle = null;
+  state.world = null;
+  state.arch = null;
+
+  // 2. The kernel: its device copy of the table, its readback pool and its
+  //    pipeline references. Idempotent, and world.dispose() would do it too.
+  if (handle) {
+    try {
+      handle.destroy();
+    } catch (e) {
+      banner('Kernel teardown failed: ' + e.message);
+    }
+  }
+
+  // 3. The world: systems, query caches, listeners, pending commands, every
+  //    archetype table and the entity index. dispose() is newer than the
+  //    published build, so a demo running against an older cozyecs falls back
+  //    to clear() + compact(), which at least gives the table buffers back.
+  if (world) {
+    try {
+      if (typeof world.dispose === 'function') {
+        world.dispose();
+      } else if (typeof world.clear === 'function' && typeof world.compact === 'function') {
+        world.clear();
+        world.compact({ strings: true, minBytes: 0 });
+      }
+    } catch (e) {
+      banner('World teardown failed: ' + e.message);
+    }
+  }
+  if (was) state.disposed++;
+  return was ? was.total : 0;
+}
+
 async function build() {
   if (state.building) return;
   state.building = true;
   try {
-    if (state.handle) state.handle.destroy();
-    state.handle = null;
+    // The old world goes away BEFORE the new one allocates, so the page never
+    // holds two worlds' tables at once (at 1M that is ~23 MB either way).
+    const freed = teardown();
     const n = state.count;
     const world = new World({ initialCapacity: n });
     const arch = world.archetype(Position, Velocity);
-    const r = rng(7);
-    world.spawnMany(arch, n, (chunk, row) => {
-      const p = chunk.col(Position);
-      const v = chunk.col(Velocity);
-      // A disc around the center, spinning.
-      const a = r() * Math.PI * 2;
-      const d = Math.sqrt(r()) * 0.7;
-      const x = Math.cos(a) * d, y = Math.sin(a) * d;
-      p.x[row] = x;
-      p.y[row] = y;
-      v.vx[row] = -y * 0.9 + (r() - 0.5) * 0.05;
-      v.vy[row] = x * 0.9 + (r() - 0.5) * 0.05;
-    });
+    spawnParticles(world, arch, n);
     const handle = await G.kernelSystem(world, 'particles', {
       components: [Position, Velocity],
       target: state.backend,
@@ -143,6 +247,7 @@ async function build() {
     world.system('watch', { group: 'render' }, () => {
       const t = performance.now();
       sampleWatched();
+      advanceMarkers();
       ema('watch', performance.now() - t);
     });
     world.system('render', { group: 'render' }, () => {
@@ -152,23 +257,39 @@ async function build() {
       ema('render', performance.now() - t);
     });
 
-    const w = state.watch;
-    w.rows = [0, 0.2, 0.4, 0.6, 0.8].map((f) => Math.floor(f * n));
-    w.ents = w.rows.map((row) => arch.entities[row]);
-    w.trails = w.rows.map(() => []);
-    w.busy = false;
-
     state.world = world;
     state.arch = arch;
     state.handle = handle;
     state.tick = 0;
+    state.simTime = 0;
     state.times = { particles: 0, watch: 0, render: 0 };
+    setupWatch(arch, n);
     drawLayout(arch);
+    syncReclaimButton();
     ui.n.textContent = n >= 1e6 ? n / 1e6 + 'M' : n / 1e3 + 'k';
     updateAutoNote();
+    if (freed > 0) noteRebuild(freed);
   } finally {
     state.building = false;
   }
+}
+
+/**
+ * One fading line in the memory section: the previous world was disposed and
+ * how much it was holding. Honest about what the number is -- the reserved
+ * bytes world.memory() reported for that world, not a heap measurement.
+ */
+function noteRebuild(freed) {
+  const note =
+    `Rebuild ${fmt(state.disposed)}: the previous world was <strong>disposed</strong>` +
+    `, giving back the ${mb(freed)} it reserved.`;
+  state.reclaimNote = note;
+  setTimeout(() => {
+    if (state.reclaimNote === note) {
+      state.reclaimNote = '';
+      updatePanel();
+    }
+  }, 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,14 +394,36 @@ function columnOffsets(arch) {
   return [p.x.byteOffset / 4, p.y.byteOffset / 4, v.vx.byteOffset / 4, v.vy.byteOffset / 4];
 }
 
+/** One empty render pass: clears the canvas when there is nothing to draw. */
+function clearGPU() {
+  const g = state.gpu;
+  const enc = g.device.createCommandEncoder();
+  enc
+    .beginRenderPass({
+      colorAttachments: [{ view: g.context.getCurrentTexture().createView(), clearValue: { r: 0.027, g: 0.035, b: 0.05, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+    })
+    .end();
+  g.device.queue.submit([enc.finish()]);
+}
+
 function renderGPU() {
   const g = state.gpu, arch = state.arch, handle = state.handle;
   if (!arch || !handle) return;
   const n = arch.count;
+  // After world.clear() + world.compact() the table is deflated to zero bytes:
+  // there is no row to read and no buffer to bind, so just clear the canvas.
+  if (n === 0 || arch.buffer.byteLength === 0) {
+    g.boundBuffer = null;
+    clearGPU();
+    return;
+  }
   let source;
   if (handle.backend === 'gpu') {
     source = handle.bufferFor(arch); // the kernel's own storage buffer
-    if (!source) return; // before the first dispatch
+    if (!source) {
+      clearGPU(); // before the first dispatch
+      return;
+    }
   } else {
     // CPU backend: upload the four columns the renderer reads.
     const bytes = arch.buffer.byteLength;
@@ -389,7 +532,7 @@ function setPressed(group, value) {
 }
 ui.backend.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
-  if (!b || b.disabled || b.dataset.v === state.backend || state.building) return;
+  if (!b || b.disabled || b.dataset.v === state.backend || state.building || state.reclaiming) return;
   state.backend = b.dataset.v;
   setPressed(ui.backend, state.backend);
   await build();
@@ -397,16 +540,91 @@ ui.backend.addEventListener('click', async (e) => {
 });
 ui.count.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
-  if (!b || b.disabled || Number(b.dataset.v) === state.count || state.building) return;
+  if (!b || b.disabled || Number(b.dataset.v) === state.count || state.building || state.reclaiming) return;
   state.count = Number(b.dataset.v);
   setPressed(ui.count, state.count);
   await build();
   resetStats();
 });
 ui.reset.addEventListener('click', async () => {
+  if (state.reclaiming) return;
   await build();
   resetStats();
 });
+
+// ---------------------------------------------------------------------------
+// Reclaiming memory: world.clear() -> world.compact() -> respawn
+// ---------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The reclaim round trip, run between ticks (a click handler, never inside a
+ * system): clear() drops every row and deflates the tables, compact() gives the
+ * buffers back, releaseUnused() gives the GPU buffers back, and then the same
+ * archetype is refilled. The archetype object, its id and the cached query
+ * chunk lists survive all of it -- only the buffers go.
+ */
+/** The button only works on a build that has the memory API; say so if not. */
+function syncReclaimButton() {
+  const world = state.world;
+  const ok = !!world && typeof world.clear === 'function' && typeof world.compact === 'function';
+  ui.reclaim.disabled = !ok;
+  ui.reclaim.title = ok
+    ? 'world.clear() then world.compact(), then spawn the particles again'
+    : 'This build of cozyecs predates world.clear() and world.compact().';
+}
+
+async function reclaim() {
+  const world = state.world, arch = state.arch, h = state.handle;
+  if (!world || !arch || state.building || state.reclaiming) return;
+  if (typeof world.clear !== 'function' || typeof world.compact !== 'function') return;
+  state.reclaiming = true;
+  ui.reclaim.disabled = true;
+  const label = ui.reclaim.textContent;
+  try {
+    const n = arch.count;
+    const before = memorySnapshot();
+    world.clear(); // events: false -> no per-entity onRemove; that is the fast path
+    world.compact({ strings: true });
+    const after = memorySnapshot();
+    // The kernel's device buffers belong to the rows that just went away.
+    const gpuFreed = typeof h.releaseUnused === 'function' ? h.releaseUnused() : -1;
+    setupWatch(arch, 0);
+    drawLayout(arch);
+    state.reclaimNote =
+      `Gave back <strong>${mb(before.total - after.total)}</strong>` +
+      (gpuFreed > 0 ? ` and ${mb(gpuFreed)} on the GPU` : '') +
+      `. Respawning…`;
+    ui.reclaim.textContent = 'Reclaimed';
+    updatePanel();
+    // Let a few frames run so the panel and the empty stage are visible.
+    await sleep(1200);
+    if (state.world !== world || state.arch !== arch) return; // rebuilt meanwhile
+
+    spawnParticles(world, arch, n);
+    if (typeof h.markCpuDirty === 'function') h.markCpuDirty(arch); // the CPU wrote kernel-owned fields
+    setupWatch(arch, n);
+    drawLayout(arch);
+    const note = `Respawned ${fmt(n)}: the deflated table re-grew, same archetype, same query.`;
+    state.reclaimNote = note;
+    setTimeout(() => {
+      if (state.reclaimNote === note) {
+        state.reclaimNote = '';
+        updatePanel();
+      }
+    }, 5000);
+  } catch (e) {
+    state.reclaimNote = 'Reclaim failed: ' + e.message;
+  } finally {
+    state.reclaiming = false;
+    ui.reclaim.disabled = false;
+    ui.reclaim.textContent = label;
+    syncReclaimButton();
+    updatePanel();
+  }
+}
+ui.reclaim.addEventListener('click', reclaim);
 
 const stats = { fps: 0, ms: 0, last: 0, shown: 0 };
 function resetStats() {
@@ -419,7 +637,7 @@ function frame(now) {
   const dtReal = stats.last ? (now - stats.last) / 1000 : 1 / 60;
   stats.last = now;
   const handle = state.handle;
-  if (!handle || state.building) return;
+  if (!handle || !state.world || state.building) return;
 
   // Uniforms: the pointer while dragging, otherwise an attractor on a slow Lissajous path.
   const ax = aspect();
@@ -435,6 +653,7 @@ function frame(now) {
   }
 
   const dt = Math.min(dtReal, 1 / 30);
+  state.simTime += dt;
   const t0 = performance.now();
   state.world.update(dt); // group 'update': the particles kernel
   const t1 = performance.now();
@@ -466,6 +685,11 @@ function mb(bytes) {
 }
 
 function drawLayout(arch) {
+  if (arch.buffer.byteLength === 0) {
+    ui.layout.innerHTML = '<div style="--c:#1b2430; flex:1; color:var(--muted)">deflated · 0 bytes</div>';
+    ui.archmeta.textContent = `0 entities · ${arch.rowBytes} bytes per row · the archetype survives, its buffer does not`;
+    return;
+  }
   const p = arch.col(Position), v = arch.col(Velocity);
   const cols = [
     ['entity', 'u32 handle', arch.entities, '#4b535d'],
@@ -481,78 +705,275 @@ function drawLayout(arch) {
     `${fmt(arch.count)} entities · ${arch.rowBytes} bytes per row · ${mb(arch.buffer.byteLength)} in one ArrayBuffer`;
 }
 
+/**
+ * Forgets every sample, trail and entity handle the markers kept. Nothing here
+ * touches the world, so it is also the watch half of `teardown()`: after it the
+ * demo holds no entity handle, row index or sampled value from the old world.
+ */
+function resetWatch() {
+  const w = state.watch;
+  w.rows = [];
+  w.ents = [];
+  w.trails = [];
+  w.samples.fill(0);
+  w.pos.fill(0);
+  w.hasSample = false;
+  w.sampleTime = 0;
+  w.lastSeq = w.seq;
+  w.ageFrames = 0;
+  w.ageSec = 0;
+  w.src = '';
+  resetMarkerDiag();
+}
+
+/** Picks the watched rows and resets everything that belongs to a sample. */
+function setupWatch(arch, n) {
+  resetWatch();
+  const w = state.watch;
+  w.rows = n > 0 ? [0, 0.2, 0.4, 0.6, 0.8].map((f) => Math.floor(f * n)) : [];
+  w.ents = w.rows.map((row) => arch.entities[row]);
+  w.trails = w.rows.map(() => []);
+}
+
+function resetMarkerDiag() {
+  state.watch.diag = { samples: 0, ageFrames: 0, ageMs: 0, rawPx: 0, extraPx: 0 };
+  history.at = 0;
+  history.filled = 0;
+}
+
+/** Drops one staging buffer; a map still in flight frees it when it settles. */
+function retire(slot) {
+  slot.dead = true;
+  if (!slot.pending) {
+    try {
+      slot.buf.destroy();
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/** Throws away the staging buffers (world rebuild, or a pool-size change). */
+function releasePool() {
+  const w = state.watch;
+  for (const slot of w.pool) retire(slot);
+  w.pool = [];
+}
+
+// A single staging buffer can only hold one readback at a time, so with one
+// buffer a fresh sample arrives every 2-4 frames and the markers stutter.
+// Rotating a few buffers means one map is always close to resolving.
+function syncPool(g) {
+  const w = state.watch;
+  const want = Math.max(1, Math.min(4, markerTuning.pool | 0));
+  if (w.pool.length === want) return;
+  if (w.pool.length > want) {
+    for (const slot of w.pool.splice(want)) retire(slot);
+    return;
+  }
+  while (w.pool.length < want) {
+    w.pool.push({
+      buf: g.device.createBuffer({ size: 80, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      pending: false,
+      dead: false,
+      seq: 0,
+      simTime: 0,
+      tick: 0,
+      wall: 0,
+    });
+  }
+}
+
+/**
+ * What was on screen over the last few frames, so an arriving sample can be
+ * checked against the marker that was actually drawn when that sample was
+ * taken. `pos` is what we drew; `raw` is where the old code would have drawn
+ * it (the newest sample, unextrapolated).
+ */
+const HISTORY = 32;
+const history = { at: 0, filled: 0, time: new Float64Array(HISTORY), pos: new Float32Array(HISTORY * 10), raw: new Float32Array(HISTORY * 10) };
+
+function recordFrame() {
+  const w = state.watch, h = history, i = h.at;
+  h.time[i] = state.simTime;
+  for (let k = 0; k < 5; k++) {
+    h.pos[i * 10 + k * 2] = w.pos[k * 2];
+    h.pos[i * 10 + k * 2 + 1] = w.pos[k * 2 + 1];
+    h.raw[i * 10 + k * 2] = w.samples[k * 4];
+    h.raw[i * 10 + k * 2 + 1] = w.samples[k * 4 + 1];
+  }
+  h.at = (i + 1) % HISTORY;
+  h.filled = Math.min(h.filled + 1, HISTORY);
+}
+
+function frameAt(simTime) {
+  const h = history;
+  let best = -1, bestD = Infinity;
+  for (let i = 0; i < h.filled; i++) {
+    const d = Math.abs(h.time[i] - simTime);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return bestD < 0.05 ? best : -1;
+}
+
+/**
+ * Takes one arriving sample as the new truth, and books how far each marker was
+ * from its particle at the instant that sample was taken:
+ *   rawPx   - the marker the old code drew there (newest sample, no extrapolation)
+ *   extraPx - the marker we actually drew there
+ * Same instant, same run, so the two numbers compare directly.
+ */
+function acceptSample(src, simTime, ageFrames, ageMs) {
+  const w = state.watch;
+  if (w.hasSample) {
+    const i = frameAt(simTime);
+    if (i >= 0) {
+      const scale = innerHeight / 2; // world units -> CSS pixels, both axes
+      let raw = 0, drawn = 0;
+      for (let k = 0; k < w.rows.length; k++) {
+        const nx = src[k * 4], ny = src[k * 4 + 1];
+        raw += Math.hypot(nx - history.raw[i * 10 + k * 2], ny - history.raw[i * 10 + k * 2 + 1]);
+        drawn += Math.hypot(nx - history.pos[i * 10 + k * 2], ny - history.pos[i * 10 + k * 2 + 1]);
+      }
+      const d = w.diag, m = Math.max(1, w.rows.length);
+      d.samples++;
+      d.ageFrames += ageFrames;
+      d.ageMs += ageMs;
+      d.rawPx += (raw / m) * scale;
+      d.extraPx += (drawn / m) * scale;
+    }
+    w.ageFrames = w.ageFrames ? w.ageFrames + 0.1 * (ageFrames - w.ageFrames) : ageFrames;
+    const sec = ageMs / 1000;
+    w.ageSec = w.ageSec ? w.ageSec + 0.1 * (sec - w.ageSec) : sec;
+  }
+  w.samples.set(src);
+  w.sampleTime = simTime;
+  w.hasSample = true;
+}
+
 /** The 'watch' system: reads the watched entities' components. */
 function sampleWatched() {
   const w = state.watch, arch = state.arch, h = state.handle, world = state.world;
-  if (!arch || !h || !w.rows.length) return;
+  if (!arch || !h || !w.rows.length || arch.count === 0) return;
   if (h.backend !== 'gpu') {
-    // CPU backend: the tables are current, so ask the world directly.
+    // CPU backend: the tables are current, so ask the world directly. Exact
+    // values, this frame, so there is nothing to extrapolate (age 0).
+    const inc = w.incoming;
     w.ents.forEach((e, k) => {
-      w.samples[k * 4] = world.getField(e, Position, 'x');
-      w.samples[k * 4 + 1] = world.getField(e, Position, 'y');
-      w.samples[k * 4 + 2] = world.getField(e, Velocity, 'vx');
-      w.samples[k * 4 + 3] = world.getField(e, Velocity, 'vy');
+      inc[k * 4] = world.getField(e, Position, 'x');
+      inc[k * 4 + 1] = world.getField(e, Position, 'y');
+      inc[k * 4 + 2] = world.getField(e, Velocity, 'vx');
+      inc[k * 4 + 3] = world.getField(e, Velocity, 'vy');
     });
+    acceptSample(inc, state.simTime, 0, 0);
     w.src = 'world.getField()';
-    pushTrails();
     return;
   }
   // GPU backend with readback 'none': the truth lives in GPU memory. Copy just
-  // these 5 rows x 4 fields (80 bytes) back, one small async read per frame.
-  if (w.busy) return;
+  // these 5 rows x 4 fields (80 bytes) back into whichever staging buffer is
+  // free, so a sample lands almost every frame instead of every 2-4.
+  const g = state.gpu;
+  syncPool(g);
+  const slot = w.pool.find((s) => !s.pending);
+  w.src = 'copied back from GPU memory';
+  if (!slot) return;
   const src = h.bufferFor(arch);
   if (!src) return;
-  const g = state.gpu;
-  if (!w.staging) w.staging = g.device.createBuffer({ size: 80, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   const p = arch.col(Position), v = arch.col(Velocity);
   const cols = [p.x, p.y, v.vx, v.vy];
   const enc = g.device.createCommandEncoder();
-  w.rows.forEach((row, k) => cols.forEach((col, c) => enc.copyBufferToBuffer(src, col.byteOffset + row * 4, w.staging, (k * 4 + c) * 4, 4)));
+  w.rows.forEach((row, k) => cols.forEach((col, c) => enc.copyBufferToBuffer(src, col.byteOffset + row * 4, slot.buf, (k * 4 + c) * 4, 4)));
   g.device.queue.submit([enc.finish()]);
-  w.busy = true;
-  const staging = w.staging;
-  staging.mapAsync(GPUMapMode.READ).then(
+  slot.pending = true;
+  slot.seq = ++w.seq;
+  slot.simTime = state.simTime; // the sim state this copy belongs to
+  slot.tick = state.tick;
+  slot.wall = performance.now();
+  slot.buf.mapAsync(GPUMapMode.READ).then(
     () => {
-      w.samples.set(new Float32Array(staging.getMappedRange()));
-      staging.unmap();
-      w.busy = false;
-      pushTrails();
+      slot.pending = false;
+      if (slot.dead) {
+        retire(slot); // the pool shrank while this copy was in flight
+        return;
+      }
+      w.incoming.set(new Float32Array(slot.buf.getMappedRange()));
+      slot.buf.unmap();
+      if (slot.seq > w.lastSeq) {
+        w.lastSeq = slot.seq;
+        acceptSample(w.incoming, slot.simTime, state.tick - slot.tick, performance.now() - slot.wall);
+      }
     },
-    () => (w.busy = false),
+    () => {
+      slot.pending = false;
+      if (slot.dead) retire(slot);
+    },
   );
-  w.src = 'copied back from GPU memory';
+}
+
+/**
+ * Where to draw each marker this frame. The newest sample is 1-2 frames old on
+ * the GPU, so step it forward by its own sampled velocity over the measured
+ * age: exactly what the kernel does (p += v * dt), which is why the markers sit
+ * on their particles instead of trailing them.
+ */
+function advanceMarkers() {
+  const w = state.watch;
+  if (!w.hasSample) return;
+  // Trust the extrapolation for a few sample ages, never further: if readbacks
+  // stall, a marker should stop rather than fly off on a stale velocity.
+  const cap = Math.min(0.25, Math.max(0.05, 3 * w.ageSec));
+  const age = markerTuning.extrapolate ? Math.min(Math.max(state.simTime - w.sampleTime, 0), cap) : 0;
+  const ax = aspect();
+  for (let k = 0; k < w.rows.length; k++) {
+    let x = w.samples[k * 4] + w.samples[k * 4 + 2] * age;
+    let y = w.samples[k * 4 + 1] + w.samples[k * 4 + 3] * age;
+    // The kernel bounces off the same walls; clamping keeps a marker inside.
+    if (x < -ax) x = -ax; else if (x > ax) x = ax;
+    if (y < -1) y = -1; else if (y > 1) y = 1;
+    w.pos[k * 2] = x;
+    w.pos[k * 2 + 1] = y;
+  }
+  recordFrame();
+  pushTrails();
 }
 
 function pushTrails() {
   const w = state.watch;
+  // One point per frame (not one per arrival), so the trail stays smooth.
   w.trails.forEach((trail, k) => {
-    trail.push(w.samples[k * 4], w.samples[k * 4 + 1]);
-    if (trail.length > 96) trail.splice(0, 2);
+    trail.push(w.pos[k * 2], w.pos[k * 2 + 1]);
+    if (trail.length > 240) trail.splice(0, 2);
   });
 }
 
 function drawOverlay(now) {
   const ctx = overlayCtx, W = ui.overlay.width, H = ui.overlay.height, w = state.watch;
   ctx.clearRect(0, 0, W, H);
-  if (!w.trails.length) return;
+  if (!w.trails.length || !w.hasSample) return;
   const s = W / innerWidth;
   const inv = 1 / aspect();
   const X = (x) => ((x * inv + 1) / 2) * W, Y = (y) => ((1 - y) / 2) * H;
   w.trails.forEach((trail, k) => {
     if (trail.length < 2) return;
     const color = WATCH_COLORS[k];
-    // Fading trail.
-    for (let i = 2; i < trail.length; i += 2) {
-      ctx.globalAlpha = (i / trail.length) * 0.9;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2 * s;
+    // Fading trail. One point per frame is four times as many points as before,
+    // so the fade is drawn as a few banded polylines instead of one stroke per
+    // segment: same look, fewer canvas calls than the old code made.
+    const pts = trail.length >> 1, bands = 12;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2 * s;
+    for (let b = 0; b < bands; b++) {
+      const i0 = Math.floor((b * (pts - 1)) / bands), i1 = Math.floor(((b + 1) * (pts - 1)) / bands);
+      if (i1 <= i0) continue;
+      ctx.globalAlpha = ((b + 1) / bands) * 0.9;
       ctx.beginPath();
-      ctx.moveTo(X(trail[i - 2]), Y(trail[i - 1]));
-      ctx.lineTo(X(trail[i]), Y(trail[i + 1]));
+      ctx.moveTo(X(trail[i0 * 2]), Y(trail[i0 * 2 + 1]));
+      for (let i = i0 + 1; i <= i1; i++) ctx.lineTo(X(trail[i * 2]), Y(trail[i * 2 + 1]));
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    const x = X(trail[trail.length - 2]), y = Y(trail[trail.length - 1]);
+    // The ring, dot and label sit on this frame's extrapolated position.
+    const x = X(w.pos[k * 2]), y = Y(w.pos[k * 2 + 1]);
     // Pulsing ring.
     const r = (7 + 2.5 * Math.sin(now / 180 + k)) * s;
     ctx.strokeStyle = color;
@@ -589,31 +1010,79 @@ function setSystem(name, ms, desc) {
   $('d-' + name).textContent = desc;
 }
 
+/**
+ * world.memory(): a diagnostic snapshot of what the world reserves. It
+ * allocates, so the panel asks for it 4x a second, never per frame. Older
+ * builds of the library do not have it; then we estimate from the one
+ * archetype this demo owns and say so.
+ */
+function memorySnapshot() {
+  const world = state.world, arch = state.arch;
+  if (!world || !arch) return null;
+  if (typeof world.memory === 'function') {
+    const m = world.memory();
+    return { ...m, estimated: false };
+  }
+  const reserved = arch.buffer.byteLength;
+  return {
+    entities: arch.count,
+    tables: { used: arch.count * arch.rowBytes, reserved },
+    entityIndex: 0,
+    strings: { count: 0 },
+    total: reserved,
+    archetypes: [],
+    estimated: true,
+  };
+}
+
+/** "11.4 / 22.0 MB": two byte counts in one unit, so they compare at a glance. */
+function pair(used, reserved) {
+  const big = Math.max(used, reserved);
+  const [div, unit] = big >= 1048576 ? [1048576, 'MB'] : [1024, 'KB'];
+  const f = (b) => (b === 0 ? '0' : big / div >= 100 ? String(Math.round(b / div)) : (b / div).toFixed(1));
+  return `${f(used)} / ${f(reserved)} ${unit}`;
+}
+
 function updatePanel() {
   const h = state.handle, w = state.watch, n = state.arch ? state.arch.count : 0;
-  if (!h) return;
+  if (!h || !state.world || !state.arch) return;
   const gpu = h.backend === 'gpu';
   const count = n >= 1e6 ? n / 1e6 + 'M' : fmt(n);
   ui.tick.textContent = 'tick ' + fmt(state.tick);
 
   // Entity memory: every component value of every entity lives in the archetype's one ArrayBuffer.
-  const bytes = state.arch.buffer.byteLength;
-  ui.mem.textContent = mb(bytes);
-  ui.bpe.textContent = (bytes / n).toFixed(1) + ' B';
+  const m = memorySnapshot();
+  state.mem = m;
+  // world.memory() sums every table in the world; `tableBytes` is this one.
+  const used = m.tables.used, reserved = m.tables.reserved, slack = reserved - used;
+  const tableBytes = state.arch.buffer.byteLength;
+  ui.mem.textContent = pair(used, reserved);
+  ui.bpe.textContent = n ? (tableBytes / n).toFixed(1) + ' B' : '–';
   // Other libraries at their measured bytes/entity (benchmarks/RESULTS.md, 100k-entity memory test), scaled to n.
   const other = (bpe) => mb(bpe * n);
-  ui.memNote.innerHTML =
-    `All ${count} entities' components live in <strong>one ${mb(bytes)} ArrayBuffer</strong>` +
-    (gpu ? ', mirrored in GPU memory.' : '.') +
-    ` At their measured bytes per entity, the same data would take about ${other(302.1)} in bitecs and ${other(978.7)} in ecsy.`;
+  ui.memNote.innerHTML = n === 0
+    ? `The world is empty: <strong>0 B</strong> in tables. <code>world.clear()</code> dropped every row and <code>world.compact()</code> deflated the table to a zero-length buffer — the archetype, its id and its query membership all survived. The ${mb(m.entityIndex)} entity index stays: the allocator never shrinks, so old handles keep reading as dead.`
+    : `All ${count} entities' components live in <strong>one ${mb(tableBytes)} ArrayBuffer</strong>` +
+      (gpu ? ', mirrored in GPU memory.' : '.') +
+      (m.estimated ? ' The table holds' : ' <code>world.memory()</code> reports') +
+      ` <strong>${mb(used)} used</strong> of ${mb(reserved)} reserved` +
+      (slack > 0 ? `, so <code>world.compact()</code> could hand back ${mb(slack)}` : ' — no slack to reclaim') +
+      (m.entityIndex ? `, plus ${mb(m.entityIndex)} for the entity index` : '') +
+      (m.estimated ? ' (measured off the archetype: this build predates <code>world.memory()</code>)' : '') +
+      `. At their measured bytes per entity, the same data would take about ${other(302.1)} in bitecs and ${other(978.7)} in ecsy.`;
+  ui.reclaimNote.innerHTML = state.reclaimNote;
   setSystem('particles', state.times.particles, gpu
     ? `kernelSystem → WGSL compute shader, ${count} entities on the GPU`
     : `kernelSystem → compiled JS loop, ${count} entities on the CPU`);
-  setSystem('watch', state.times.watch, gpu ? 'copies 5 entities (80 bytes) back from the GPU' : 'world.getField() on 5 entities');
+  setSystem('watch', state.times.watch, gpu
+    ? `copies 5 entities (80 bytes) back from the GPU through ${w.pool.length} rotating staging buffers`
+    : 'world.getField() on 5 entities');
   setSystem('render', state.times.render, !state.gpu ? 'Canvas 2D pixels' : gpu
     ? `draws ${count} instances straight from bufferFor()`
     : `uploads 4 columns, then draws ${count} instances`);
-  ui.watchsrc.textContent = w.src;
+  ui.watchsrc.textContent = gpu
+    ? `${w.src} · ${w.ageFrames.toFixed(1)} frames old${markerTuning.extrapolate ? ', extrapolated' : ''}`
+    : `${w.src} · exact`;
   ui.watch.innerHTML = w.ents
     .map((e, k) => {
       const x = w.samples[k * 4], y = w.samples[k * 4 + 1];
@@ -638,6 +1107,116 @@ for (const tab of document.querySelectorAll('.tabs button')) {
 // It waits for the GPU to finish, so 'gpu' numbers are real GPU time, not just submission.
 window.cozyDemo = {
   state,
+  // Marker latency knobs and measurements. To see the old behaviour:
+  //   cozyDemo.markerTuning.pool = 1; cozyDemo.markerTuning.extrapolate = false;
+  //   cozyDemo.resetMarkerStats(); await new Promise(r => setTimeout(r, 5000));
+  //   cozyDemo.markerStats()
+  markerTuning,
+  resetMarkerStats: resetMarkerDiag,
+  /**
+   * ageFrames/ageMs: how old a sample is when it lands.
+   * rawOffsetPx: how far the marker would be from its particle, in CSS pixels,
+   *   if it were drawn at the raw sample (the old behaviour).
+   * offsetPx: the same distance for what is actually drawn now.
+   * Both are measured at the instant a new sample arrives, so they compare directly.
+   */
+  markerStats() {
+    const d = state.watch.diag, s = d.samples;
+    if (!s) return { samples: 0 };
+    return {
+      samples: s,
+      ageFrames: +(d.ageFrames / s).toFixed(2),
+      ageMs: +(d.ageMs / s).toFixed(2),
+      rawOffsetPx: +(d.rawPx / s).toFixed(2),
+      offsetPx: +(d.extraPx / s).toFixed(2),
+      pool: state.watch.pool.length,
+      extrapolate: markerTuning.extrapolate,
+    };
+  },
+  memory: () => memorySnapshot(),
+  reclaim,
+  rebuild: build,
+  /**
+   * Proof that a rebuild hands the old world back. Drives `cycles` rebuilds,
+   * rotating the backend and the particle count so both renderer paths run (the
+   * kernel's own storage buffer on the GPU, the uploaded copy on the CPU), and
+   * steps a few frames each time so the kernel really dispatches and the
+   * renderer really builds a bind group over those buffers.
+   *
+   * `collected` holds the verdict of three WeakRefs on the FIRST world, its
+   * archetype and its table ArrayBuffer: all three must be true. `heap` comes
+   * from performance.measureUserAgentSpecificMemory() when the page is
+   * cross-origin-isolated -- it counts ArrayBuffers and collects before it
+   * measures -- and otherwise from performance.memory, which does NOT see
+   * ArrayBuffer bytes; each reading says which one it is.
+   */
+  async leakCheck({ cycles = 16, counts = [10_000, 100_000, 250_000], backends, frames = 4 } = {}) {
+    const be = backends || (state.gpu ? ['gpu', 'cpu'] : ['cpu']);
+    // measureUserAgentSpecificMemory is the only browser reading that counts
+    // ArrayBuffer bytes, but it needs cross-origin isolation, is refused in some
+    // embeddings, and is allowed to wait for the next GC -- so it is raced and
+    // caught, and performance.memory (JS objects only) is the stated fallback.
+    const heap = async () => {
+      if (crossOriginIsolated && performance.measureUserAgentSpecificMemory) {
+        try {
+          const r = await Promise.race([performance.measureUserAgentSpecificMemory(), sleep(20000)]);
+          if (r) return { bytes: r.bytes, source: 'measureUserAgentSpecificMemory (ArrayBuffers included)' };
+        } catch {
+          /* refused here; fall through */
+        }
+      }
+      return {
+        bytes: performance.memory ? performance.memory.usedJSHeapSize : -1,
+        source: 'performance.memory (ArrayBuffers NOT included)',
+      };
+    };
+    // A WeakRef only reads as collected after a collection has run. Chrome
+    // started with --js-flags=--expose-gc gives one directly; otherwise the
+    // measurement above collects first; with neither, say the verdict is weak.
+    const collect = async () => {
+      if (typeof gc === 'function') {
+        for (let i = 0; i < 3; i++) {
+          gc();
+          await sleep(0);
+        }
+        return 'gc()';
+      }
+      return 'measurement only';
+    };
+    const step = async () => {
+      for (let i = 0; i < frames; i++) {
+        state.simTime += 1 / 60;
+        state.world.update(1 / 60);
+        state.world.update(1 / 60, 'render');
+        state.tick++;
+      }
+      if (state.gpu) await state.gpu.device.queue.onSubmittedWorkDone();
+    };
+    await step();
+    const first = [new WeakRef(state.world), new WeakRef(state.arch), new WeakRef(state.arch.buffer)];
+    const before = { count: state.arch.count, worldTotal: memorySnapshot().total, heap: await heap() };
+    const series = [];
+    for (let i = 0; i < cycles; i++) {
+      state.backend = be[i % be.length];
+      state.count = counts[i % counts.length];
+      setPressed(ui.backend, state.backend);
+      setPressed(ui.count, state.count);
+      await build();
+      await step();
+      series.push({ cycle: i + 1, backend: state.handle.backend, count: state.arch.count, worldTotal: memorySnapshot().total });
+    }
+    const after = { count: state.arch.count, worldTotal: memorySnapshot().total, heap: await heap() };
+    const collectedBy = await collect();
+    const [world, arch, buffer] = first.map((r) => r.deref() === undefined);
+    return {
+      cycles,
+      disposed: state.disposed,
+      before,
+      after,
+      collected: { world, archetype: arch, tableBuffer: buffer, by: collectedBy },
+      series,
+    };
+  },
   async measure({ backend = state.backend, count = state.count, frames = 120 } = {}) {
     state.backend = backend;
     state.count = count;
@@ -645,8 +1224,10 @@ window.cozyDemo = {
     setPressed(ui.count, count);
     await build();
     const step = () => {
+      state.simTime += 1 / 60;
       state.world.update(1 / 60);
       state.world.update(1 / 60, 'render');
+      state.tick++;
     };
     const settle = () => (state.gpu ? state.gpu.device.queue.onSubmittedWorkDone() : Promise.resolve());
     for (let i = 0; i < 10; i++) step();
@@ -669,7 +1250,13 @@ window.cozyDemo = {
 // ---------------------------------------------------------------------------
 
 (async () => {
-  state.gpu = 'gpu' in navigator ? await initGPU().catch(() => null) : null;
+  // A browser can advertise navigator.gpu and then never settle requestAdapter()
+  // (headless Chrome with no adapter does exactly that), which used to hang the
+  // boot here for good. Bound the wait and fall back to the CPU path instead.
+  const gpuSetup = 'gpu' in navigator
+    ? Promise.race([initGPU().catch(() => null), sleep(6000).then(() => null)])
+    : Promise.resolve(null);
+  state.gpu = await gpuSetup;
   if (!state.gpu) {
     state.backend = 'cpu';
     state.count = 100_000;

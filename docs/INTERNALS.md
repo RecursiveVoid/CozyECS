@@ -125,9 +125,153 @@ the stubs (including `_`-prefixed members) is a cross-module contract.
   **Every TypedArray obtained from `col()`, `enabledArray()` or `entities` is invalid after
   growth** (it still points at the old buffer): re-fetch after structural changes; systems
   re-fetch per tick.
+- **Reallocation is one private primitive.** `_allocate(cap, n)` allocates the buffer, rebuilds
+  every view and `_base`, copies the first `n` rows of each column, and bumps `_layoutVersion`
+  (which invalidates every cached row plan). `_resize(cap)` is `_allocate(cap, this.count)` plus
+  `capacity = cap`. Nothing in it assumes `cap >= capacity`, so shrinking is the same code path
+  as growing — which is what makes `shrinkToFit` possible at all.
+- `nextCapacity(cap)` is the growth policy: x2 below 65536 rows, then x1.25 rounded up to a
+  multiple of 4096, clamped to `MAX_ENTITIES`. `nextCapacity(0) === 1`, so a zero-capacity table
+  re-grows correctly through `pushRow`'s `if (r === this.capacity) this._resize(nextCapacity(r))`.
+  `capacityFor(n, initialCapacity)` runs that policy forward from `initialCapacity` and returns
+  the capacity a table grown one row at a time would have while holding `n` rows — the target
+  `World.compact` deflates to, so a compacted table does not reallocate again on the next spawn.
 - `col(c)` = `columns[c.id]` (undefined for absent or tags). `has(c)` = mask test.
   `isEnabled(c, row)`: absent -> false; not enableable -> true; else `enabled[c.id][row] === 1`.
 - Archetypes never touch entity locations. `edgesAdd/edgesRemove` are written only by World.
+
+## Reclaiming table memory (archetype.ts, world.ts, strings.ts)
+
+Design rule: **mechanism, never policy.** Nothing here runs on a tick, there is no background or
+heuristic GC, and no entity references are traced. The engine decides when to reclaim; the ECS
+only makes it possible, because the buffers are private.
+
+- `Archetype.shrinkToFit(minCapacity = 0)` -> `_resize(max(count, minCapacity))`, returning
+  whether it reallocated. **"Deflate, don't delete."** The archetype OBJECT, its `id`, `mask`,
+  `key`, `components`, `edgesAdd`/`edgesRemove` and its place in every query's `chunks` all
+  survive; only the storage is replaced. This is load-bearing: `World._archetypes` is
+  append-only and archetype ids index it, queries cache archetype OBJECTS and the transition
+  edges cache archetype references, so an archetype must never be removed or renumbered.
+  Capacity 0 leaves a zero-length `ArrayBuffer` and zero-length views.
+- `World.compact(options)` walks `_archetypes` and, per archetype, computes
+  `target = count === 0 ? 0 : capacityFor(count, _initialCapacity)`, skips when
+  `(capacity - target) * rowBytes < minBytes` (default 4096, so compaction never churns), and
+  calls `shrinkToFit(target)`. It never grows a table and is idempotent.
+- `World.clear(options)` is the bulk form of `destroy`: `EntityAllocator.releaseAll()` frees
+  every index in one pass with its generation BUMPED, then every `archetype.count = 0`, then
+  (unless `compact: false`) `shrinkToFit(0)` per table. Order matters — `releaseAll` reads a
+  PLACED entity's generation out of `archetypes[aid].entities[row]`, not out of `slot`, so the
+  rows must still be there when it runs. With `events: true` the (entity, owning archetype)
+  pairs are snapshotted BEFORE anything is reset and `_fireEvents(e, owner, null)` is called
+  afterwards, which needs only the handle and the owner's mask. A listener that spawns during
+  that pass is fine: `shrinkToFit(0)` keeps whatever rows exist by then.
+  `releaseAll` sizes the free stack to hold every index [0, next), so `memory().entityIndex` can
+  GROW across a `clear()`. The per-index arrays never shrink, which is exactly what keeps stale
+  handles reading as dead.
+- `StringTable._rebuild(keep)` is the one seam that breaks the table's append-only rule. It
+  compacts `_strings` in place (write index `w <= id` always, so it is safe in place), rebuilds
+  `_ids`, and returns a `Uint32Array` remap indexed by OLD id. `World._compactStrings` does two
+  passes over the `str` columns of live rows — one to build `keep`, one to rewrite the ids — so
+  stored values survive and only ids held outside the world go stale.
+- `World.dispose()` is the rung above all of these and is specified in
+  [World teardown](#world-teardown-worldts-gpuruntimets) below.
+- `_assertBetweenTicks(method)` guards both `compact` and `clear`: it throws when
+  `_iterDepth > 0`, when `_flushing`, or when `_commands.length !== 0`. Compaction while a query
+  is iterating would pull the buffer out from under the loop's hoisted column views, and a
+  queued command still names a (archetype, row) pair.
+
+## World teardown (world.ts, gpu/runtime.ts)
+
+`World.dispose()` is the whole-world rung above `destroy` / `removeSystem` / `clear`. Order is
+load-bearing:
+
+1. **Dispose hooks first**, with the world still intact, so a hook can walk it before any storage
+   is released.
+2. **Systems**: `Scheduler.drain()` empties every group *first*, then `onDestroy()` runs on class
+   systems in reverse registration order. Because the scheduler is already empty, an `onDestroy`
+   that calls `removeSystem(this)` is a no-op and nothing is destroyed twice.
+3. **Queries**: `query._dispose()` per cached query. This is not bookkeeping — a compiled
+   trampoline closes over the chunks' *column arrays*, so a retained plan retains the tables.
+4. `onAdd` / `onRemove` listener arrays, then `_hookCount` / `_hasEvents` back to zero.
+5. **Pending commands are released, not applied.** `CommandBuffer._release()` drops the commands
+   and the capacity. No `onRemove` fires for a queued destroy.
+6. **Tables**: `archetype._dispose()` per archetype — `count = 0`, `shrinkToFit(0)`,
+   `edgesAdd`/`edgesRemove` cleared, `_plans` / `_lastSource` / `_lastPlan` nulled — then
+   `_archetypes.length = 0`. `_archetypes` is the array `EntityAllocator` holds, so
+   emptying it is also what stops the allocator's liveness checks reaching a table.
+7. `EntityAllocator.dispose()` — `slot`, `bigAid` and `freeStack` become the shared empty arrays
+   and `next`/`aliveCount`/`freeCount` go to 0; `next === 0` is what makes every handle dead.
+8. View cache, component registry, and `strings._rebuild(EMPTY_U8)` (leaves id 0, `''`).
+
+`_disposed` is set **before** step 1, so a hook that tries to mutate hits the same guard as
+everyone else. `dispose()` shares `compact`/`clear`'s iteration guard but *not* their
+empty-queue requirement: discarding the queue is the point. A hook or an `onDestroy` that throws
+is caught, the teardown runs to completion, and the first error is rethrown at the end.
+
+### The dispose hook seam, and why the core must not import the GPU module
+
+The dependency rule is one-way and checked: `src/gpu/*` imports the core **for types only**, and
+the core imports nothing from `src/gpu`. The two are separate bundles — `dist/index.esm.js` has no
+`GPUBuffer`/`createBuffer`/WGSL reference in it, and `dist/gpu/index.esm.js` has no runtime import
+at all (it is self-contained: 112,745 bytes of unminified ESM against the core's 44,234). A `world.dispose()` that
+released device buffers by calling into `src/gpu` would put GPU code in every core bundle,
+including the bundles of apps that never touch WebGPU.
+
+So the core offers a seam instead of a dependency:
+
+```ts
+export function registerWorldDisposeHook(hook: WorldDisposeHook): () => void
+```
+
+A module-level array in `world.ts` holding **nothing but functions** — it cannot pin a world —
+walked at the top of `dispose()`. A module that registers one hook at import time finds its own
+per-world state through its own weakly keyed table; that is the pattern the seam is designed for,
+and it is what an engine with per-world resources of its own should use.
+
+**What `cozyecs/gpu` actually does today is different, and the difference is deliberate on one
+axis and accidental on another.** `attachDisposalHook(world)` in `gpu/runtime.ts` runs the first
+time a kernel is registered on a world and duck-types a *per-instance* seam, `world._onDispose(fn)`.
+It cannot call `registerWorldDisposeHook`: that would be a **runtime** import of the core from the
+GPU bundle, which is exactly the dependency the split exists to prevent (and with two bundles, a
+module-level registry is per-bundle anyway). `World._onDispose(fn)` is therefore an internal
+instance method — it pushes onto that world's own callback list, which `dispose()` runs right
+after the module-level hooks, while the world is still intact — and the GPU module duck-types it.
+
+Verified against `dist` (one `kernelSystem` call on a fresh `World`, 8k entities): `typeof
+world._onDispose === 'function'`, the world does **not** get an own `dispose` property, and
+`gpuDeviceMemory().heldBytes` goes 162,048 → 0 across `dispose()`.
+
+`attachDisposalHook` keeps a compatibility branch for a core published *before* the seam existed:
+if `_onDispose` is missing but `dispose()` is present, it installs an own-property wrapper that
+calls `disposeWorldKernels(world)` and then the original method. That branch is now a fallback for
+old cores rather than the live path, and it can go once such versions are unsupported.
+
+`disposeWorldKernels(world)` stays exported regardless: it is the explicit call for an app on a
+core without any seam, and it is what the wrapper invokes.
+
+## Testing memory: two ways to fool yourself
+
+Both of these were found in `__tests__/dispose.test.ts` and `__tests__/leak.test.ts` as tests that
+passed, or failed, for the wrong reason. They are properties of V8 and of the trampoline cache, not
+of the code under test, so a rewrite that "simplifies" either test back into the obvious shape will
+quietly stop testing anything.
+
+- **A suspended `async` frame keeps its locals alive.** A `WeakRef` collectability assertion
+  written directly in an `async` test body never clears, because the world is still reachable
+  through the awaiting frame's locals. Build and dispose inside a plain (non-`async`) helper that
+  returns *only* the weak references, then `await` the collection after it has returned — see
+  `buildAndDispose` / `buildAndDisposeWith` in `dispose.test.ts`. The same trap has a loop form:
+  the last iteration's locals stay reachable from a live frame, so a churn loop whose objects must
+  be collectable belongs in its own function (`registerAndRemoveSystems` in `leak.test.ts`).
+- **A shape rejection needs a never-before-compiled shape *and* a stable callback.** Two
+  independent gates sit in front of `tstats.shapeRejections`. First, `resolvePlan` returns `null`
+  the first time it sees a callback (`seenForPlan`), so no plan — and therefore no shape build — is
+  attempted until the **same function object** is passed again: an arrow written at the call site,
+  or a single tick, never gets there. Second, `shapes` is a module-level `Map`: a shape some
+  earlier test already compiled is a cache *hit* and is never refused, whatever
+  `_setTrampolineShapeLimit(0)` says. A test that forces the generic fallback must therefore
+  declare its own components, so its loop shape is unique to it — otherwise the assertion passes
+  or fails depending on which tests ran before it.
 
 ## Entity location update rules (world.ts)
 
@@ -333,3 +477,87 @@ Recommended patterns for hot loops, fastest first:
 - `Scheduler` keeps `Map<group, Runnable[]>`; `add` builds a new array with the system inserted
   after all entries with `(order, _seq) <=` its own; `remove` builds a new array without it.
   `group(name)` returns the stored array or a shared frozen empty array.
+
+## What allocates
+
+A tick must allocate nothing. `__tests__/alloc.test.ts` guards that, and the numbers below say
+where the line is. They are measured, not estimated: see "How these were measured".
+
+Figures are **net bytes per call on Apple M4 / node 22**, after warm-up, with the caller's
+argument literals included — because that is what a user pays. For scale, on the same meter: one
+`{ a, b, c }` object costs 48-65 bytes (V8 may add in-object slack) and one `[]` costs 32.
+
+### Free (0 bytes, every call)
+
+| Call | Why it is free |
+| --- | --- |
+| `world.get(e, C)` | writes into `_views[C.id]`, created once per component and overwritten in place. The returned object is therefore **shared and reused**: read it, do not retain it. |
+| `world.getField(e, C, key)` | returns a number out of the column. |
+| `world.has`, `isAlive`, `isEnabled`, `enable` | mask / slot arithmetic only. |
+| `query.count()` | sums `chunk.count`. |
+| `chunk.col(C)`, `chunk.enabledArray(C)` | an array index into `columns` / `enabled`. |
+| `world.flush()` with an empty buffer | early return. |
+| `world.update(dt)` | `Scheduler.group()` returns the stored array; the loop is index-based. |
+| a plain chunk loop over `q.chunks` | ~0.4 B/call over 10k entities / 3 chunks, i.e. noise. |
+| `q.forEachChunk(list, kernel)` and `q.forEach(list, fn)` | ~0.2-1.8 B/call over 10k entities, i.e. noise — **provided the kernel and the component list are hoisted**, see below. |
+
+### Allocates
+
+| Call | Bytes | What is allocated |
+| --- | --- | --- |
+| `world.set(e, C, { x: 1 })` | 32 | only the caller's `{ x: 1 }` literal; the write itself is free. Prefer writing columns directly in a hot loop. |
+| `world.set(e, C, { s: freshString })` | ~57 | the literal, plus the string and its `StringTable` entry when it is new. This one **retains**: the string table is append-only (`world.compact({ strings: true })` rebuilds it). |
+| `world.add(e, C, { hp: 1 })` + `remove` | 32 | the values literal. `add`/`remove` of a tag with warm transition edges is free. |
+| `world.spawn(archetype)` + `destroy` | ~8 | amortized free-list / slot growth. |
+| `world.spawn([Position, Velocity])` | ~1200 | the array literal plus the archetype-resolution path below. **Pass an `Archetype`** (`world.archetype(...)` once at setup) on any path that runs more than once. |
+| `world.archetype(Position, Velocity)` | ~1150 | the rest-args array, `normalizeComponents` (a fresh array, a comparator closure and `Array.prototype.sort`), the key string, the `Map` lookup. |
+| `world.query({ all: [...] })` on a **cache hit** | ~1400 | the desc literal plus `Query.keyOf`, which normalizes and sorts all three lists and builds the key before the `Map` hit. Create queries once; store the `Query`. |
+| `new World()` | ~7.7k | allocator arrays, the empty archetype, the maps. |
+| `world.memory()` | ~1450 (4 archetypes) | diagnostic by contract: one object per archetype plus the arrays. Call it on demand, never per frame. |
+| `world.compact()` with nothing to free | ~40 | the stats object. Not for per-frame use either. |
+
+`Array.prototype.sort` with a comparator costs ~1 KB per call in V8 regardless of length (measured:
+985 B to sort a two-element array). That single line in `normalizeComponents` dominates every
+archetype and query lookup above, which is why those calls belong in setup code and not in a loop.
+
+### The traps
+
+- **An inline `forEachChunk` / `forEach` callback.** The trampoline plan is cached on the query and
+  keyed on the callback's **function identity**, so a lambda written at the call site misses on
+  every call and the plan is rebuilt: 57 B per call, ~120-175 B per tick for a three-system world,
+  forever. Define kernels once at module or system scope.
+- **An inline component list.** `q.forEachChunk([Position, Velocity], kernel)` allocates that array
+  every call (~32-64 B). Hoist it to a `const` next to the kernel.
+- **Retaining what is reused.** The `world.get()` view object and the column objects / TypedArrays
+  from `chunk.col()` are snapshots: the view is overwritten on the next `get`, and the TypedArrays
+  are replaced whenever the table is reallocated (grown by `pushRow`, or shrunk by
+  `shrinkToFit` / `compact`). Re-read them after any structural change.
+
+### How these were measured
+
+`process.memoryUsage().heapUsed` increases monotonically between collections, so its delta across a
+window in which **no collection ran** is the number of bytes allocated in that window, garbage
+included. That last part is the point: per-tick garbage is invisible to any after-the-fact heap
+measurement, yet it is exactly what causes frame-time spikes. The procedure per figure is:
+
+1. `global.gc()` twice, so the window starts with an empty young generation and has the whole
+   nursery (~16-21 MB) to fill without triggering a scavenge.
+2. a `PerformanceObserver` on `'gc'` entries runs for the window; if it reports any collection the
+   delta is an underestimate, so the measurement is retried with an eighth of the iterations.
+   Entries are delivered on a later turn of the event loop, so the count must be read after a
+   `setTimeout(0)` — reading it synchronously always reports zero.
+3. a loop of the same length doing only arithmetic is measured the same way and subtracted.
+4. the operation is warmed up first, and one full measurement window is measured and discarded:
+   V8 tiers the system bodies, row loops and compiled trampolines up over the first few thousand
+   ticks, and each of those compilations is itself an allocation. On the fixture in
+   `__tests__/alloc.test.ts` the first measured window reports ~395 B/tick after 1000 warm-up
+   ticks, 3.8 after 2000, and 1.2 from 4000 on. Steady state is 1.9 B/tick.
+5. a control loop allocating one `{ a, b, c }` per iteration must come out at its real ~48-65 bytes.
+   Without that check a broken meter reports zero for everything — which is how V8's **sampling
+   heap profiler** (`node:inspector`, `HeapProfiler.startSampling`) behaves here: it does not
+   observe inline new-space allocation in this configuration and reported 1.5 KB for a loop that
+   allocated 11 MB. Do not use it for this.
+
+`npm run test:alloc` runs the guard (jest under `--expose-gc`, coverage off, since the coverage
+transform perturbs the numbers). Under a plain `npm test` both of its tests skip themselves with a
+note, because `global.gc` is absent.
