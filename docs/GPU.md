@@ -343,13 +343,13 @@ frame, residency is broken somewhere.
 
 | mode | when results land | `auto` default | measured break-even | use for |
 |---|---|---:|---:|---|
-| `'async'` (default) | **next frame** | 45k entities | 34k–64k | simulation the CPU reads a frame late |
-| `'sync-frame'` | this frame, after you `await` | 700k entities | ~554k, or never up to 1M | CPU logic that must see this frame's values |
-| `'none'` | never (GPU-resident) | 45k entities | 23k–49k | data consumed by rendering |
+| `'async'` (default) | **next frame** | 63k entities | 56k–123k | simulation the CPU reads a frame late |
+| `'sync-frame'` | this frame, after you `await` | 820k entities | ~684k, or never up to 1M | CPU logic that must see this frame's values |
+| `'none'` | never (GPU-resident) | 63k entities | 51k–117k | data consumed by rendering |
 
 (The default is for a kernel of baseline CPU cost; `auto` scales it by the
 kernel's estimated cost. The measured ranges span the two benchmark kernels on
-an M4 through Dawn. See [section 4](#4-choosing-a-target).)
+an M4 through Dawn, 2026-10-07. See [section 4](#4-choosing-a-target).)
 
 `'async'` is the honest default: `world.update()` cannot block, so the map
 resolves on a later turn of the event loop and the values you read from
@@ -679,7 +679,9 @@ memory, which is why they are absent from the census as well.
 
 `target: 'auto'` (the default) picks per dispatch, from the total matched entity
 count. The raw costs below were measured on an Apple M4 (Metal 3, macOS 26.5) with a
-12-op gravity+integrate kernel:
+12-op gravity+integrate kernel, in the machine state that set
+`BASELINE_CPU_NS_PER_ENTITY = 1.14` (2026-09; the same machine later ran the CPU
+backend ~2x faster, which is why the thresholds — not this anchor — were re-fitted):
 
 | N | CPU | GPU encode only | GPU encode + sync |
 |---:|---:|---:|---:|
@@ -698,39 +700,45 @@ the clock stops), against the CPU backend (`kernel-cpu`):
 
 | kernel | `'none'` | `'async'` | `'sync-frame'` |
 |---|---:|---:|---:|
-| simple (2 adds) | ~49k (round 1: ~65k) | ~64k (~74k) | > 1M (never wins up to 1M) |
-| gravity (integrate + bounce) | ~23k (~26k) | ~34k (~32k) | ~554k (~530k) |
+| simple (2 adds) | ~117k (2026-09-18: ~49k) | ~123k (~64k) | > 1M (> 1M) |
+| gravity (integrate + bounce) | ~51k (~23k) | ~56k (~34k) | ~684k (~554k) |
 
-Round 2 (2026-09-18) is the current build, median of 5 isolated processes,
-every GPU cell checked row by row against the CPU backend. Break-evens are
-interpolated log-linearly between the measured sizes (1k, 10k, 30k, 50k, 100k,
-300k, 1M), so treat them as rough. Full tables:
+The 2026-10-07 refresh is the current calibration, median of 5 isolated
+processes, every GPU cell checked row by row against the CPU backend.
+Break-evens are interpolated log-linearly between the measured sizes (1k, 10k,
+30k, 50k, 100k, 300k, 1M), so treat them as rough. Full tables:
 [benchmarks/RESULTS.md, "GPU / kernel"](../benchmarks/RESULTS.md#gpu--kernel).
 
-Selected ms/frame (round 2; the machine was loaded, so compare ratios):
+**They roughly doubled since September**, because the same machine ran the CPU
+backend 1.9–2.4x faster (1M simple: 0.93 ms, was 1.80 ms) while the GPU's fixed
+per-frame cost stayed flat. The break-even is where the CPU's per-entity cost
+pays back that fixed cost, so halving the CPU cost doubles the entity count. If
+your own numbers matter, run `calibrateAuto` rather than trusting these.
+
+Selected ms/frame (2026-10-07, median of 5):
 
 | kernel | N | `kernel-cpu` | bitecs | GPU `'none'` | GPU `'async'` | GPU `'sync-frame'` |
 |---|---:|---:|---:|---:|---:|---:|
-| simple | 10k | 0.011 | 0.015 | 0.057 | 0.073 | 0.365 |
-| simple | 100k | 0.149 | 0.149 | 0.057 | 0.091 | 0.455 |
-| simple | 1M | 1.80 | 2.12 | 0.350 | 1.18 | 2.06 |
-| gravity | 10k | 0.025 | 0.028 | 0.057 | 0.083 | 0.350 |
-| gravity | 100k | 0.271 | 0.282 | 0.058 | 0.111 | 0.450 |
-| gravity | 1M | 2.70 | 3.12 | 0.364 | 1.40 | 2.30 |
+| simple | 10k | 0.0059 | 0.0077 | 0.062 | 0.065 | 0.263 |
+| simple | 100k | 0.061 | 0.077 | 0.076 | 0.080 | 0.345 |
+| simple | 1M | 0.932 | 1.10 | 0.293 | 0.348 | 0.971 |
+| gravity | 10k | 0.015 | 0.015 | 0.063 | 0.068 | 0.306 |
+| gravity | 100k | 0.138 | 0.156 | 0.079 | 0.087 | 0.391 |
+| gravity | 1M | 1.42 | 1.54 | 0.357 | 0.429 | 1.23 |
 
-A GPU frame has a fixed floor, flat from 1k to 50k entities: ~0.057 ms for
-`'none'`, ~0.07-0.08 ms for `'async'` and ~0.35 ms for `'sync-frame'` (the
-readback round trip) in round 2; ~0.04 / ~0.04 / ~0.22 ms on the less loaded
-round-1 run. `'async'` at 1M is much slower than `'none'` because every frame's
-results really are copied back (and the 1M `'async'` cells spread 0.5-1.5 ms
-across repeats, depending on how many readbacks coalesce).
-Multiplying each break-even by the kernel's CPU cost gives ~50-68 µs per frame
-for both kernels in fire-and-forget modes, so one constant scaled by kernel cost
-fits. At the baseline 1.14 ns/entity:
+A GPU frame has a fixed floor, flat from 1k to 50k entities: ~0.061–0.067 ms for
+`'none'`, ~0.065–0.074 ms for `'async'` and ~0.23–0.30 ms for `'sync-frame'`
+(the readback round trip). `'async'` at 1M is slower than `'none'` because every
+frame's results really are copied back (and the 1M `'async'` cells still spread
+widely across repeats, depending on how many readbacks coalesce).
+Multiplying each break-even by the kernel's measured CPU cost gives ~71–73 µs
+per frame for both kernels in fire-and-forget modes and ~0.93 ms synchronous, so
+one constant per mode, scaled by kernel cost, fits both to within 6%. At the
+baseline 1.14 ns/entity:
 
 ```
-readback 'none' | 'async'   ->  GPU above ~45 000 entities
-readback 'sync-frame'       ->  GPU above ~700 000 entities
+readback 'none' | 'async'   ->  GPU above ~63 000 entities
+readback 'sync-frame'       ->  GPU above ~820 000 entities
 ```
 
 Those are `DEFAULT_AUTO_THRESHOLDS`. They encode a simple cost model:
@@ -738,20 +746,26 @@ Those are `DEFAULT_AUTO_THRESHOLDS`. They encode a simple cost model:
 ```
 GPU wins  <=>  entities × cpuNsPerEntity  >=  GPU_FIXED_OVERHEAD_NS[mode]
 
-GPU_FIXED_OVERHEAD_NS.fireAndForget = 45 000 × 1.14 ns ≈ 51 µs    ('async' / 'none')
-GPU_FIXED_OVERHEAD_NS.synchronous   = 700 000 × 1.14 ns ≈ 798 µs   ('sync-frame')
-BASELINE_CPU_NS_PER_ENTITY          = 1.14 ns  (the 12-op kernel above, 1.140 ms at 1M)
+GPU_FIXED_OVERHEAD_NS.fireAndForget = 63 000 × 1.14 ns ≈ 72 µs    ('async' / 'none')
+GPU_FIXED_OVERHEAD_NS.synchronous   = 820 000 × 1.14 ns ≈ 935 µs   ('sync-frame')
+BASELINE_CPU_NS_PER_ENTITY          = 1.14 ns  (a normalization anchor: the CPU cost
+                                                a kernel must estimate at to use the
+                                                thresholds unscaled, ~16 ops today)
 ```
 
 `cpuNsPerEntity` is `estimateCPUNanosPerEntity(ir)` from the CPU backend,
-computed once per kernel as `0.52 + 0.065 × opCount` ns: a fixed per-entity
-cost (loop, index, memory traffic) plus a per-op cost, fitted to the measured
-`simple` and `gravity` break-evens below (an op-count proxy, `1.14 × opCount / 12`,
+computed once per kernel as `0.26 + 0.055 × opCount` ns: a fixed per-entity
+cost (loop, index, memory traffic) plus a per-op cost, fitted to the CPU cost
+measured for `simple` (6 ops, 0.593 ns/entity) and `gravity` (20 ops, 1.365
+ns/entity) in the 30k–100k band (an op-count proxy, `1.14 × opCount / 12`,
 is used if the estimator is unavailable; `cpuCostEstimate(ir)` exposes the value). So the
 effective threshold is
 `threshold × clamp(BASELINE_CPU_NS_PER_ENTITY / cpuNsPerEntity, 1/8, 4)`: a
-kernel estimated at 4× the baseline cost switches to the GPU at ~11k entities
-instead of 45k. Hysteresis (×1.25 / ÷1.25) keeps a count oscillating around the
+kernel estimated at 4× the baseline cost switches to the GPU at ~16k entities
+instead of 63k. With those two constants the switch points land at ~122k
+(`simple`) and ~53k (`gravity`), i.e. within 6% of every measured
+fire-and-forget break-even and within 1% for `gravity`'s `'sync-frame'`.
+Hysteresis (×1.25 / ÷1.25) keeps a count oscillating around the
 threshold from flapping between backends. `autoPrefersGPU(ir, entities,
 readback, thresholds, currentlyGPU, cpuNs?)` is exported so you can check a
 decision without dispatching. The GPU's own per-entity cost is folded into the
@@ -766,7 +780,7 @@ import * as cozy from 'cozyecs';
 import { calibrateAuto, kernelSystem } from 'cozyecs/gpu';
 
 const cal = await calibrateAuto(cozy);   // ~0.7 s; null (and no change) without a GPU
-// cal.thresholds -> e.g. { fireAndForget: 24_963, synchronous: 226_721 }, already applied
+// cal.thresholds -> e.g. { fireAndForget: 48_108, synchronous: 401_716 }, already applied
 ```
 
 It runs a branch-free probe kernel on a throwaway world at two sizes, on the CPU
@@ -782,8 +796,12 @@ bundled copy would also carry a second component-id counter.
 
 Expect roughly ±30% between runs on a busy machine; cache the result (e.g. in
 `localStorage`) and pass it to `setAutoThresholds` on later launches. Measured
-on the same M4: `fireAndForget` ~18k-27k in Node (Dawn) and ~25k in Chrome 152,
-against the 45k built-in default.
+on the same M4 (2026-10-07, three consecutive runs): `fireAndForget` 48k / 48k /
+72k and `synchronous` 255k / 402k / 780k, around the 63k / 820k built-in
+defaults — the fire-and-forget figure is stable enough to trust, the
+`'sync-frame'` one is not, so treat it as a hint. Earlier runs read ~18k-27k in
+Node and ~25k in Chrome 152, when this machine's CPU backend was ~2x slower; the
+whole point of calibrating is that it moves.
 
 You can also set thresholds by hand, globally or per kernel:
 
@@ -798,26 +816,35 @@ or per kernel with `thresholds: { ... }`.
 benchmark gives every entity the same values, so a branch such as the gravity
 kernel's bounce is perfectly predictable. With varied data (heights spread
 over a range) the same kernel measured ~5.7 ns/entity on the CPU instead of
-~2.7, because of branch mispredictions; the GPU does not care. The estimator
+~2.7, because of branch mispredictions (measured 2026-09-18; both numbers are
+from the slower machine state, it is the ~2x ratio that matters, and the
+estimator's own level was re-fitted since); the GPU does not care. The estimator
 counts ops and cannot see this, so a branchy kernel over irregular data
 switches to the GPU later than it should. If that is your case, lower that
 kernel's `thresholds`, or pin `target: 'gpu'` above a few tens of thousands of
 entities.
 
-**Calibration.** With that estimator the effective thresholds for the two
-benchmark kernels are:
+**Calibration (2026-10-07).** With that estimator the effective thresholds for
+the two benchmark kernels are:
 
 | kernel | estimate | `'none'` / `'async'` threshold | measured `'none'` / `'async'` | `'sync-frame'` threshold | measured |
 |---|---:|---:|---:|---:|---:|
-| simple (6 ops) | 0.91 ns | ~56k | ~49k / ~64k | ~877k | never, up to 1M |
-| gravity (20 ops) | 1.82 ns | ~28k | ~23k / ~34k | ~438k | ~554k |
+| simple (6 ops) | 0.59 ns | ~122k | ~117k / ~123k | ~1.58M | never, up to 1M |
+| gravity (20 ops) | 1.36 ns | ~53k | ~51k / ~56k | ~687k | ~684k |
 
-Every switch point is within ~0.8-1.25x of the measured break-even. The one
-remaining miss is small: a `simple`-sized kernel under `'sync-frame'` moves to
-the GPU from ~877k entities, where the GPU is still ~13% slower than the CPU at
-1M (2.06 vs 1.80 ms). An earlier estimator (`0.095 × opCount`, no fixed term)
-rated `simple` 3.3× cheaper than `gravity` against a measured ~2×, and kept
-`simple` on the CPU up to ~90k entities under `'none'`; that is fixed.
+Every switch point is within 1.06x of the measured break-even, and
+`simple`/`'sync-frame'` correctly sits above 1M so it never switches there.
+
+Both earlier fits missed in the opposite directions, which is the reason the
+constants are re-fitted whenever the benchmark is re-run:
+
+- `0.095 × opCount` (no fixed term) rated `simple` 3.3× cheaper than `gravity`
+  against a measured 2.3×, and kept `simple` on the CPU up to ~90k entities
+  under `'none'`.
+- `0.52 + 0.065 × opCount` with 45k / 700k thresholds over-estimated the CPU by
+  1.3-1.5× once this machine's CPU backend got ~2× faster, so it switched to the
+  GPU at ~56k (`simple`) and ~28k (`gravity`) — roughly half of the real
+  break-even, and about 2.3× slower than the CPU at 50k entities.
 
 `workgroup_size` is **256** for every kernel: 64, 128 and 256 measured within
 noise of each other (0.54–0.65 ms at 1M), 32 was clearly slower, and 256 is the

@@ -573,23 +573,32 @@ describe('closure-tree interpreter (new Function unavailable)', () => {
 
 describe('estimateCPUNanosPerEntity', () => {
   test('a fixed per-entity cost plus a per-op cost, counted from the IR body', () => {
-    expect(CPU_NS_PER_ENTITY_FIXED).toBe(0.52);
-    expect(CPU_NS_PER_OP).toBe(0.065);
+    expect(CPU_NS_PER_ENTITY_FIXED).toBe(0.26);
+    expect(CPU_NS_PER_OP).toBe(0.055);
     const ir = parse('(p, v, dt, u) => { v.y += u.g * dt; p.x += v.x * dt; p.y += v.y * dt; }', { uniformNames: ['g'] });
-    expect(estimateCPUNanosPerEntity(ir)).toBeCloseTo(0.52 + ir.opCount * 0.065, 10);
+    expect(estimateCPUNanosPerEntity(ir)).toBeCloseTo(0.26 + ir.opCount * 0.055, 10);
     const tiny = parse('(p) => { p.x = 1; }', { components: [Pos] });
     expect(tiny.opCount).toBe(2); // one assignment + one field access
-    expect(estimateCPUNanosPerEntity(tiny)).toBeCloseTo(0.52 + 0.13, 10);
+    expect(estimateCPUNanosPerEntity(tiny)).toBeCloseTo(0.26 + 0.11, 10);
     const looped = parse('(p) => { for (let k = 0; k < 10; k++) { p.x += 1; } }', { components: [Pos] });
-    expect(estimateCPUNanosPerEntity(looped)).toBeGreaterThan(0.52 + 10 * 0.065);
+    expect(estimateCPUNanosPerEntity(looped)).toBeGreaterThan(0.26 + 10 * 0.055);
   });
 
-  test('matches the measured cost ratio of the benchmark kernels (~2x, not 3.3x)', () => {
+  test('matches the measured cost of the benchmark kernels (2026-10-07: 0.593 / 1.365 ns, ratio 2.3x)', () => {
     const simple = parse('(p, v) => { p.x += v.x; p.y += v.y; }');
     const gravity = parse(
       '(p, v, dt, u) => { v.y += u.g * dt; p.x += v.x * dt; p.y += v.y * dt; if (p.y < 0) { p.y = 0; v.y = -v.y * 0.5; } }',
       { uniformNames: ['g'] },
     );
+    expect(simple.opCount).toBe(6);
+    expect(gravity.opCount).toBe(20);
+    // The constants are a two-point fit to these two measurements (M4, 30k-100k
+    // entities, benchmarks/RESULTS.md "GPU / kernel"), so each must land within
+    // 2% of the measured ns/entity -- that is what makes the `auto` thresholds
+    // land on the measured break-evens.
+    expect(estimateCPUNanosPerEntity(simple)).toBeCloseTo(0.593, 1);
+    expect(Math.abs(estimateCPUNanosPerEntity(simple) / 0.593 - 1)).toBeLessThan(0.02);
+    expect(Math.abs(estimateCPUNanosPerEntity(gravity) / 1.365 - 1)).toBeLessThan(0.02);
     const ratio = estimateCPUNanosPerEntity(gravity) / estimateCPUNanosPerEntity(simple);
     expect(ratio).toBeGreaterThan(1.5);
     expect(ratio).toBeLessThan(2.5);

@@ -338,29 +338,63 @@ describe('f64 fields', () => {
 });
 
 describe('auto break-even', () => {
-  test('defaults: ~45k fire-and-forget, ~700k sync-frame (Dawn/M4), scaled by estimated CPU cost', async () => {
+  test('defaults: ~63k fire-and-forget, ~820k sync-frame (Dawn/M4), scaled by estimated CPU cost', async () => {
     const gpu = await freshEntry();
     const t = { ...gpu.DEFAULT_AUTO_THRESHOLDS };
-    expect(t).toEqual({ fireAndForget: 45_000, synchronous: 700_000 });
-    expect(gpu.GPU_FIXED_OVERHEAD_NS.fireAndForget).toBeCloseTo(45_000 * gpu.BASELINE_CPU_NS_PER_ENTITY);
-    expect(gpu.GPU_FIXED_OVERHEAD_NS.synchronous).toBeCloseTo(700_000 * gpu.BASELINE_CPU_NS_PER_ENTITY);
+    expect(t).toEqual({ fireAndForget: 63_000, synchronous: 820_000 });
+    expect(gpu.GPU_FIXED_OVERHEAD_NS.fireAndForget).toBeCloseTo(63_000 * gpu.BASELINE_CPU_NS_PER_ENTITY);
+    expect(gpu.GPU_FIXED_OVERHEAD_NS.synchronous).toBeCloseTo(820_000 * gpu.BASELINE_CPU_NS_PER_ENTITY);
     expect(gpu.BASELINE_CPU_NS_PER_ENTITY).toBe(1.14);
     const ir = { opCount: 12 } as never;
     const base = gpu.BASELINE_CPU_NS_PER_ENTITY;
-    expect(gpu.autoPrefersGPU(ir, 44_999, 'async', t, false, base)).toBe(false);
-    expect(gpu.autoPrefersGPU(ir, 45_000, 'async', t, false, base)).toBe(true);
-    expect(gpu.autoPrefersGPU(ir, 45_000, 'none', t, false, base)).toBe(true);
-    expect(gpu.autoPrefersGPU(ir, 699_999, 'sync-frame', t, false, base)).toBe(false);
-    expect(gpu.autoPrefersGPU(ir, 700_000, 'sync-frame', t, false, base)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 62_999, 'async', t, false, base)).toBe(false);
+    expect(gpu.autoPrefersGPU(ir, 63_000, 'async', t, false, base)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 63_000, 'none', t, false, base)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 819_999, 'sync-frame', t, false, base)).toBe(false);
+    expect(gpu.autoPrefersGPU(ir, 820_000, 'sync-frame', t, false, base)).toBe(true);
     // A kernel 4x as expensive per entity pays back the overhead 4x sooner.
-    expect(gpu.autoPrefersGPU(ir, 11_250, 'async', t, false, base * 4)).toBe(true);
-    expect(gpu.autoPrefersGPU(ir, 11_249, 'async', t, false, base * 4)).toBe(false);
+    expect(gpu.autoPrefersGPU(ir, 15_750, 'async', t, false, base * 4)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 15_749, 'async', t, false, base * 4)).toBe(false);
     // Clamped: an absurdly cheap estimate never pushes the threshold past 4x.
-    expect(gpu.autoPrefersGPU(ir, 180_000, 'async', t, false, 1e-9)).toBe(true);
-    expect(gpu.autoPrefersGPU(ir, 179_999, 'async', t, false, 1e-9)).toBe(false);
+    expect(gpu.autoPrefersGPU(ir, 252_000, 'async', t, false, 1e-9)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 251_999, 'async', t, false, 1e-9)).toBe(false);
     // Hysteresis: once on the GPU it stays until threshold / 1.25.
-    expect(gpu.autoPrefersGPU(ir, 36_000, 'async', t, true, base)).toBe(true);
-    expect(gpu.autoPrefersGPU(ir, 35_999, 'async', t, true, base)).toBe(false);
+    expect(gpu.autoPrefersGPU(ir, 50_400, 'async', t, true, base)).toBe(true);
+    expect(gpu.autoPrefersGPU(ir, 50_399, 'async', t, true, base)).toBe(false);
+  });
+
+  // The defaults are a fit, so pin what they were fitted TO: with each benchmark
+  // kernel's measured CPU cost per entity, the switch point must land on that
+  // kernel's measured break-even (benchmarks/RESULTS.md "GPU / kernel",
+  // 2026-10-07: simple 0.593 ns, 117k none / 123k async; gravity 1.365 ns,
+  // 51k none / 56k async / 684k sync-frame).
+  test('defaults land on the measured break-evens of the benchmark kernels', async () => {
+    const gpu = await freshEntry();
+    const t = { ...gpu.DEFAULT_AUTO_THRESHOLDS };
+    const ir = { opCount: 12 } as never;
+    // Smallest count at which `auto` switches, for a kernel costing `ns` per entity.
+    const switchPoint = (ns: number, readback: 'async' | 'sync-frame'): number => {
+      let lo = 1;
+      let hi = 4_000_000;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (gpu.autoPrefersGPU(ir, mid, readback, t, false, ns)) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo;
+    };
+    const near = (got: number, measured: number): number => measured / got;
+    const simpleFF = switchPoint(0.593, 'async');
+    const gravityFF = switchPoint(1.365, 'async');
+    const gravitySync = switchPoint(1.365, 'sync-frame');
+    expect(near(simpleFF, 117_450)).toBeGreaterThan(0.6); // 'none'
+    expect(near(simpleFF, 123_299)).toBeLessThan(1.6); // 'async'
+    expect(near(gravityFF, 51_492)).toBeGreaterThan(0.6);
+    expect(near(gravityFF, 55_849)).toBeLessThan(1.6);
+    expect(near(gravitySync, 684_058)).toBeGreaterThan(0.6);
+    expect(near(gravitySync, 684_058)).toBeLessThan(1.6);
+    // `sync-frame` never won for `simple` up to 1M, so it must not switch there.
+    expect(gpu.autoPrefersGPU(ir, 1_000_000, 'sync-frame', t, false, 0.593)).toBe(false);
   });
 
   test('user override: per-kernel thresholds and setAutoThresholds', async () => {
@@ -369,7 +403,7 @@ describe('auto break-even', () => {
     const base = gpu.BASELINE_CPU_NS_PER_ENTITY;
     expect(gpu.autoPrefersGPU(ir, 100, 'async', { fireAndForget: 100, synchronous: 1 }, false, base)).toBe(true);
     gpu.setAutoThresholds({ fireAndForget: 1 });
-    expect(gpu.DEFAULT_AUTO_THRESHOLDS.fireAndForget).toBe(45_000); // defaults stay frozen
+    expect(gpu.DEFAULT_AUTO_THRESHOLDS.fireAndForget).toBe(63_000); // defaults stay frozen
   });
 
   test('cpuCostEstimate falls back to the op-count proxy and is always positive', async () => {
@@ -630,16 +664,21 @@ describe("target 'auto': estimator calibration and backend prediction (mock devi
     });
   }
 
-  test('the simple benchmark kernel switches near its measured break-even (49k none / 64k async), not at ~90k', async () => {
+  test('the simple benchmark kernel switches near its measured break-even (117k none / 123k async), not at ~56k', async () => {
     const gpu = await freshEntry();
     const mock = mockDevice();
     gpu.setGPUProvider(mock.gpu);
     const h = await autoKernel(gpu, new World(), 'SimpleAuto');
     const t = { ...gpu.DEFAULT_AUTO_THRESHOLDS };
     const ns = gpu.cpuCostEstimate(h.ir);
-    expect(gpu.autoPrefersGPU(h.ir, 45_000, 'none', t, false, ns)).toBe(false);
-    expect(gpu.autoPrefersGPU(h.ir, 70_000, 'none', t, false, ns)).toBe(true);
-    expect(gpu.autoPrefersGPU(h.ir, 70_000, 'async', t, false, ns)).toBe(true);
+    expect(h.ir.opCount).toBe(6);
+    expect(ns).toBeCloseTo(0.59, 10); // the measured 0.593 ns/entity
+    // Below the band the CPU keeps it; the 2026-10-07 re-fit moved this up from
+    // ~56k, where the GPU was still ~2.3x slower.
+    expect(gpu.autoPrefersGPU(h.ir, 56_000, 'none', t, false, ns)).toBe(false);
+    expect(gpu.autoPrefersGPU(h.ir, 100_000, 'none', t, false, ns)).toBe(false);
+    expect(gpu.autoPrefersGPU(h.ir, 130_000, 'none', t, false, ns)).toBe(true);
+    expect(gpu.autoPrefersGPU(h.ir, 130_000, 'async', t, false, ns)).toBe(true);
     h.destroy();
   });
 

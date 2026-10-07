@@ -650,21 +650,25 @@ world.update(1 / 60);  // dispatches inside the system's group, never blocks
   from the GPU buffer. If you dispatch faster than the GPU completes readbacks,
   frames are coalesced, never lost: `sync()` still waits for every frame.
 - **`target: 'auto'`** picks CPU or GPU on every dispatch. The defaults are
-  45k entities (`'async'`/`'none'`) and 700k (`'sync-frame'`) for a
+  63k entities (`'async'`/`'none'`) and 820k (`'sync-frame'`) for a
   baseline-cost kernel (1.14 ns/entity on the CPU), scaled by the kernel's
   estimated CPU cost. They are one machine's numbers (an M4 through Dawn);
   override them with `setAutoThresholds()` or the `thresholds` option.
 - **Measured break-even** (entities above which the GPU beats the compiled CPU
-  loop, M4 + Dawn, median of 5 isolated runs, every cell checked row by row):
+  loop, M4 + Dawn, 2026-10-07, median of 5 isolated runs, every cell checked
+  row by row):
 
   | kernel | `'none'` | `'async'` | `'sync-frame'` |
   |---|---:|---:|---:|
-  | simple (`p.x += v.dx; p.y += v.dy`) | ~49k | ~64k | never, up to 1M |
-  | gravity (integrate + bounce) | ~23k | ~34k | ~554k |
+  | simple (`p.x += v.dx; p.y += v.dy`) | ~117k | ~123k | never, up to 1M |
+  | gravity (integrate + bounce) | ~51k | ~56k | ~684k |
 
   `auto` keeps smaller queries on the CPU. At 1M entities the GPU with `'none'` runs the
-  simple kernel in 0.35 ms against 1.80 ms on the CPU, but below ~20k it is
-  always slower (a ~0.06 ms per-frame floor). `'sync-frame'` rarely pays off.
+  simple kernel in 0.29 ms against 0.93 ms on the CPU, but below ~50k it is
+  always slower (a ~0.065 ms per-frame floor). `'sync-frame'` rarely pays off.
+  These are **one machine in one state**: the same M4 measured the CPU backend
+  1.9-2.4x faster in October than in September, which doubled every break-even.
+  `calibrateAuto(cozy)` measures the real one on the user's device.
 - **The CPU backend is a speedup on its own.** `kernelSystem(world, name,
   { target: 'cpu', ... })` compiles the kernel into a loop with every column
   as a constant: 1.08–1.30x bitecs on the simple kernel up to 50k entities and

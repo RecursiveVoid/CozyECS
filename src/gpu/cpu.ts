@@ -5,8 +5,8 @@
  * this backend rides on that machinery).
  *
  * This is not just the fallback for "no WebGPU". It is the fast path for every
- * kernel below the GPU break-even (~45k entities with readback 'async' or
- * 'none', ~700k when the frame awaits readback with 'sync-frame'), which is
+ * kernel below the GPU break-even (~63k entities with readback 'async' or
+ * 'none', ~820k when the frame awaits readback with 'sync-frame'), which is
  * most kernels in most games. It is also the parity oracle the GPU backend is
  * tested against.
  *
@@ -187,10 +187,10 @@ export function generateCPUSource(ir: KernelIR, opts?: CompileCPUOptions): strin
  * regardless of its body: the loop, the row index, and moving the row's
  * columns through the cache. See {@link estimateCPUNanosPerEntity}.
  */
-export const CPU_NS_PER_ENTITY_FIXED = 0.52;
+export const CPU_NS_PER_ENTITY_FIXED = 0.26;
 
 /** Marginal CPU cost of one IR op, in ns. See {@link estimateCPUNanosPerEntity}. */
-export const CPU_NS_PER_OP = 0.065;
+export const CPU_NS_PER_OP = 0.055;
 
 /**
  * Estimated per-entity cost in nanoseconds, used by `target: 'auto'` to decide
@@ -199,18 +199,26 @@ export const CPU_NS_PER_OP = 0.065;
  * The model is affine, not proportional. A purely per-op model (the round-1
  * `0.095 * ops`) rated the 6-op `simple` kernel 3.3x cheaper than the 20-op
  * `gravity` kernel, while the measured CPU cost ratio in the break-even range
- * (25k-100k entities) is ~2x: a cheap kernel still pays for the loop and the
+ * (25k-100k entities) is 2.3x: a cheap kernel still pays for the loop and the
  * memory traffic. That made `auto` keep `simple` on the CPU up to ~90k entities
- * against a measured break-even of ~49k (`'none'`).
+ * against the ~49k break-even measured at the time (`'none'`).
  *
- * Calibration (Apple M4 + Dawn, benchmarks/RESULTS.md "GPU / kernel", round 2):
- * the constants put the effective `'async'`/`'none'` threshold at the geometric
- * mean of each kernel's measured `'none'` and `'async'` break-even:
- *   simple  (6 ops):  0.91 ns -> ~56k entities (measured 49k none / 64k async)
- *   gravity (20 ops): 1.82 ns -> ~28k entities (measured 23k none / 34k async)
- * The absolute values are normalized to `BASELINE_CPU_NS_PER_ENTITY` in
- * ./runtime; only the ratio between kernels matters. If the GPU benchmark is
- * re-run, re-fit both constants together.
+ * Calibration (Apple M4 + Dawn, benchmarks/RESULTS.md "GPU / kernel",
+ * 2026-10-07 refresh): the two constants are a two-point fit to the CPU cost
+ * MEASURED in the break-even band (30k/50k/100k entities), and the thresholds
+ * in ./runtime then put each kernel's effective `'async'`/`'none'` switch point
+ * at the geometric mean of its measured `'none'` and `'async'` break-even:
+ *   simple  (6 ops):  0.59 ns (measured 0.593) -> ~122k entities
+ *                     (measured 117k none / 123k async)
+ *   gravity (20 ops): 1.36 ns (measured 1.365) -> ~53k entities
+ *                     (measured 51k none / 56k async)
+ * The previous fit (0.52 + 0.065 * ops) was made when this machine ran the same
+ * kernels 1.9-2.4x slower; it over-estimated the CPU by 1.3-1.5x, which scaled
+ * the thresholds DOWN and moved `auto` to the GPU at about half the real
+ * break-even (~2.3x slower at 50k entities for `simple`). The absolute values
+ * are normalized to `BASELINE_CPU_NS_PER_ENTITY` in ./runtime; only the ratio
+ * between kernels matters. If the GPU benchmark is re-run, re-fit both
+ * constants together with the thresholds.
  *
  * Ops are counted from the IR body (`deriveFacts`, loop bodies scaled by their
  * trip cap). For a pairwise kernel the result is per PAIR: multiply by the

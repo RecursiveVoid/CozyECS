@@ -112,13 +112,13 @@ export type KernelBackend = 'gpu' | 'cpu' | 'none';
  *  - `'async'` (default): the readback is issued after the dispatch and applied
  *    to the archetype tables when the map resolves -- typically DURING THE NEXT
  *    FRAME. CPU code reading those fields sees last frame's values. Cheapest
- *    mode that still keeps the CPU in the loop (GPU wins above ~45k entities
+ *    mode that still keeps the CPU in the loop (GPU wins above ~63k entities
  *    for a baseline-cost kernel). When the app dispatches faster than the GPU
  *    completes readbacks, frames are COALESCED, never lost: a later readback
  *    copies the full resident state, so `sync()` still sees every dispatch.
  *  - `'sync-frame'`: same dispatch, but the app is expected to
  *    `await handle.sync()` (or {@link flushKernels}) before it presents the
- *    frame. Adds a ~0.2 ms fixed readback round trip; GPU wins above ~700k entities
+ *    frame. Adds a ~0.25 ms fixed readback round trip; GPU wins above ~820k entities
  *    for a baseline-cost kernel (heavier kernels much sooner).
  *  - `'none'`: never read back. The data stays GPU-resident and is meant to be
  *    consumed by rendering through {@link KernelRuntime.bufferFor}. CPU reads of
@@ -133,26 +133,31 @@ export type ReadbackMode = 'async' | 'sync-frame' | 'none';
  * the GPU is. `auto` scales them by kernel cost (see
  * {@link autoPrefersGPU}) and the app can override them.
  *
- * Supporting numbers (Dawn on M4, full per-frame cost including upload-once
- * residency and readback): a simple integrate kernel breaks even at ~65k
- * entities with `readback: 'none'`, ~74k with `'async'` and above 1M with
- * `'sync-frame'`; the heavier gravity+bounce kernel at ~26k / ~32k / ~530k.
- * Normalized by each kernel's CPU cost, the GPU's fixed per-frame cost is
- * ~50-68 us fire-and-forget (a ~0.04 ms floor plus ~0.25 ns/entity), i.e.
- * ~45k entities at 1.14 ns/entity. The sync-frame default of 700k sits
- * between the two kernels' measurements.
+ * Supporting numbers (Dawn on M4, 2026-10-07 refresh; full per-frame cost
+ * including upload-once residency and readback): the simple integrate kernel
+ * breaks even at ~117k entities with `readback: 'none'`, ~123k with `'async'`
+ * and above 1M with `'sync-frame'`; the heavier gravity+bounce kernel at ~51k /
+ * ~56k / ~684k. Normalized by each kernel's measured CPU cost, the GPU's fixed
+ * per-frame cost is ~71-73 us fire-and-forget (a ~0.065 ms floor plus the GPU's
+ * own per-entity cost) and ~0.93 ms synchronous, i.e. ~63k and ~820k entities
+ * at 1.14 ns/entity -- one constant per mode fits both kernels to within 6%.
+ *
+ * These doubled between 2026-09-18 (45k / 700k) and 2026-10-07: the same
+ * machine ran the CPU backend 1.9-2.4x faster while the GPU's fixed cost stayed
+ * flat. They are one machine in one state -- `calibrateAuto` measures the real
+ * thing on the user's device.
  */
 export interface AutoThresholds {
-  /** Entities above which GPU wins for `'async'` / `'none'`. Default 45_000. */
+  /** Entities above which GPU wins for `'async'` / `'none'`. Default 63_000. */
   fireAndForget: number;
-  /** Entities above which GPU wins for `'sync-frame'`. Default 700_000. */
+  /** Entities above which GPU wins for `'sync-frame'`. Default 820_000. */
   synchronous: number;
 }
 
 /** The process-wide defaults. Mutated only through {@link setAutoThresholds}. */
 export const DEFAULT_AUTO_THRESHOLDS: Readonly<AutoThresholds> = Object.freeze({
-  fireAndForget: 45_000,
-  synchronous: 700_000,
+  fireAndForget: 63_000,
+  synchronous: 820_000,
 });
 
 /** Live defaults: {@link DEFAULT_AUTO_THRESHOLDS} until {@link setAutoThresholds} is called. */
@@ -196,24 +201,29 @@ export function resetAutoThresholds(): void {
   };
 }
 
-/** Op count of the kernel the break-even numbers were measured with. */
+/** Op count used by the fallback proxy when the CPU estimator is unavailable. */
 const BASELINE_OPS = 12;
 /**
- * CPU cost of that baseline kernel, ns per entity (M4: 1.140 ms at 1M
- * entities). Must agree with the calibration inside `estimateCPUNanosPerEntity`
- * (./cpu): the ratio `BASELINE_CPU_NS_PER_ENTITY / estimate` is what scales the
- * thresholds, so a kernel estimated at the baseline cost gets them unchanged.
+ * The CPU cost, ns per entity, that a kernel must estimate at to get the
+ * thresholds above UNCHANGED: a pure normalization anchor, not a measurement of
+ * any particular kernel. Only its ratio to `estimateCPUNanosPerEntity` (./cpu)
+ * matters -- rescaling it and both thresholds by the same factor is a no-op.
+ *
+ * Kept at 1.14 through the 2026-10-07 re-fit (where it was re-checked) so the
+ * exported constant and `GPU_FIXED_OVERHEAD_NS` stay stable; under the current
+ * estimator 1.14 ns/entity is a ~16-op kernel (it was the 12-op kernel of the
+ * first calibration, when the machine ran ~2x slower).
  */
 export const BASELINE_CPU_NS_PER_ENTITY = 1.14;
 /**
  * The GPU's fixed per-frame cost the CPU has to "pay back" before the GPU wins,
  * in ns, as implied by the default thresholds at the baseline CPU cost:
- *  - fire-and-forget (`'async'` / `'none'`): 45k x 1.14 ns = ~51 us (encode,
+ *  - fire-and-forget (`'async'` / `'none'`): 63k x 1.14 ns = ~72 us (encode,
  *    uniform upload, submit, dispatch latency, the async map issue; measured
- *    ~50-68 us per frame on Dawn/M4 once normalized by kernel cost);
- *  - `'sync-frame'`: 700k x 1.14 ns = ~800 us (dominated by the round trip:
- *    submit, wait for the queue, map, copy back; measured ~530k entities for
- *    the gravity kernel and >1M for the simple one).
+ *    71-73 us per frame on Dawn/M4 once normalized by kernel cost);
+ *  - `'sync-frame'`: 820k x 1.14 ns = ~935 us (dominated by the round trip:
+ *    submit, wait for the queue, map, copy back; measured ~684k entities for
+ *    the gravity kernel, i.e. 934 us, and >1M for the simple one).
  * The GPU's own per-entity cost is folded into these. The model is therefore
  *   `GPU wins  <=>  entities * cpuNsPerEntity >= GPU_FIXED_OVERHEAD_NS[mode]`,
  * which is exactly `entities >= threshold * (BASELINE_CPU_NS_PER_ENTITY / cpuNs)`.
@@ -251,7 +261,9 @@ export function cpuCostEstimate(ir: KernelIR): number {
  * scaled by estimated kernel cost, because a heavier kernel pays the GPU's fixed
  * overhead back sooner:
  * `threshold * clamp(BASELINE_CPU_NS_PER_ENTITY / cpuNsPerEntity, 1/8, 4)`
- * (see {@link GPU_FIXED_OVERHEAD_NS} for the model). `cpuNsPerEntity` defaults
+ * (see {@link GPU_FIXED_OVERHEAD_NS} for the model; with the current estimator
+ * the upper clamp never binds and the lower one only above ~161 ops).
+ * `cpuNsPerEntity` defaults
  * to {@link cpuCostEstimate}`(ir)`; the runtime passes its cached value.
  *
  * Applies hysteresis: once on the GPU, a dispatch stays on the GPU until the
